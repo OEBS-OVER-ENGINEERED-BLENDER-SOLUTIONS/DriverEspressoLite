@@ -1,0 +1,40 @@
+schema_version = "1.0.0"
+
+id = "driver_espresso_lite"
+version = "1.6.3"
+name = "Driver Espresso Lite"
+tagline = "A starter set of native Blender driver recipes"
+maintainer = "OEBS Studios"
+type = "add-on"
+
+website = "https://docs.oebs-studios.com/driverespresso/"
+
+tags = ["Animation"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+# Driver Espresso is pure Python and ships no platform-specific binaries, so it
+# is compatible with every platform Blender supports.
+
+[build]
+# The add-on is the package below; everything else in this folder is working
+# material and stays out of the archive.
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/docs/",
+  "/Future Updates/",
+  # Tooling and the test suite. tools/package.py excludes the same set, so
+  # both build paths produce the same archive.
+  "/tools/",
+  "/tests/",
+  "/backups/",
+  "EXTRACTION_REPORT*",
+  ".product-build",
+  "*.zip",
+  "*.blend1",
+]
