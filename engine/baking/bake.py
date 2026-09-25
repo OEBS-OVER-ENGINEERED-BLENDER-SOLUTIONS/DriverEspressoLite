@@ -15,6 +15,29 @@ frame and reading the property is the one method that is always correct.
 from __future__ import annotations
 
 import bpy
+import math
+
+
+def preflight_targets(targets):
+    """Refuse read-only owners and Actions before sampling or rollback copies."""
+    for target in targets:
+        owner, path = _resolve_owner_and_path(target.owner, target.data_path)
+        action = getattr(getattr(owner, "animation_data", None), "action", None)
+        for block in (owner, action):
+            if block is not None and not getattr(block, "is_editable", True):
+                return f"Cannot bake {path}: {block.name} is linked or read-only."
+    return ""
+
+
+def _verified_key(id_block, path, index, frame, value):
+    curve = _find_action_fcurve(id_block, path, index)
+    animation = id_block.animation_data
+    frame = animation.nla_tweak_strip_time_to_scene(frame, invert=True)
+    return curve is not None and any(
+        abs(point.co[0] - frame) < 1e-4
+        and math.isclose(point.co[1], value, rel_tol=1e-5, abs_tol=1e-5)
+        for point in curve.keyframe_points
+    )
 
 
 def _resolve_owner_and_path(owner, data_path):
@@ -63,11 +86,13 @@ def _find_action_fcurve(id_block, data_path, index):
     if action is None:
         return None
     direct = getattr(action, "fcurves", None)
+    slot = getattr(id_block.animation_data, "action_slot", None)
     bags = [direct] if direct else [
         bag.fcurves
         for layer in getattr(action, "layers", ()) or ()
         for strip in getattr(layer, "strips", ()) or ()
         for bag in getattr(strip, "channelbags", ()) or ()
+        if slot is not None and bag.slot_handle == slot.handle
     ]
     for fcurves in bags:
         for fcurve in fcurves or ():
@@ -76,7 +101,51 @@ def _find_action_fcurve(id_block, data_path, index):
     return None
 
 
+def action_is_shared(owner):
+    """Count artist users, excluding transaction holding copies and fake users."""
+    from .transaction import holding_user_pointers
+
+    animation = getattr(owner, "animation_data", None)
+    action = getattr(animation, "action", None)
+    if action is None:
+        return False
+    users = bpy.data.user_map(subset={action}).get(action, set())
+    holding = holding_user_pointers()
+    if any(user != owner and user.as_pointer() not in holding
+           for user in users):
+        return True
+    return any(strip.action == action for track in animation.nla_tracks for strip in track.strips)
+
+
+def _isolate_shared_action(owner):
+    if not action_is_shared(owner):
+        return
+    animation = owner.animation_data
+    slot = getattr(animation, "action_slot", None)
+    identifier = slot.identifier if slot is not None else ""
+    copied = animation.action.copy()
+    animation.action = copied
+    if identifier:
+        animation.action_slot = next(item for item in copied.slots if item.identifier == identifier)
+
+
 def bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, progress=None,
+                 smart=False, smart_tolerance=0.01, smart_passes=2):
+    """Bake atomically, joining the caller's cleanup transaction when present."""
+    from .transaction import bake_transaction
+    targets = list(targets)
+    reason = preflight_targets(targets)
+    if reason:
+        return 0, 0, reason
+    with bake_transaction(bpy.context, targets=targets):
+        return _bake_targets(
+            scene, targets, start=start, end=end, step=step,
+            remove_driver=remove_driver, progress=progress, smart=smart,
+            smart_tolerance=smart_tolerance, smart_passes=smart_passes,
+        )
+
+
+def _bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, progress=None,
                  smart=False, smart_tolerance=0.01, smart_passes=2):
     """Bake a list of (owner, data_path, index) targets to keyframes.
 
@@ -92,6 +161,10 @@ def bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, prog
     frame re-evaluates the entire depsgraph, so a per-target loop would repeat
     that work once for each of a colour plan's three channels.
     """
+    targets = list(targets)
+    reason = preflight_targets(targets)
+    if reason:
+        return 0, 0, reason
     frames = frame_list(start, end, step)
     if not frames:
         return 0, 0, "Nothing to bake: the frame range is empty."
@@ -146,24 +219,13 @@ def bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, prog
                     internal_helpers.resources_from_driver(fcurve.driver)
                 )
 
-    # Phase 2: remove drivers (optional), then write the samples as keyframes.
+    for id_block in dict.fromkeys(plan[1] for plan in plans):
+        _isolate_shared_action(id_block)
+
+    # Keep every driver until all replacement keys have been verified.
     keyframes = 0
     dense_total = 0
     for owner, id_block, data_path, resolved_path, index, samples in plans:
-        if remove_driver:
-            try:
-                if index >= 0:
-                    owner.driver_remove(data_path, index)
-                else:
-                    owner.driver_remove(data_path)
-            except Exception as exc:
-                # Missing drivers are fine; a driver that is still there after
-                # driver_remove failed is a partial bake and must abort.
-                if _find_driver(id_block, resolved_path, index) is not None:
-                    raise RuntimeError(
-                        "Could not remove the driver on %s: %s" % (resolved_path, exc)
-                    ) from exc
-
         # Smart bake reduces WHICH samples get written; it never changes the
         # samples themselves, so a curve it declines to thin bakes exactly as
         # it always did.
@@ -183,9 +245,11 @@ def bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, prog
             # would otherwise read as its rest value.
             _assign(id_block, resolved_path, index, value)
             if index >= 0:
-                id_block.keyframe_insert(resolved_path, index=index, frame=frame)
+                inserted = id_block.keyframe_insert(resolved_path, index=index, frame=frame)
             else:
-                id_block.keyframe_insert(resolved_path, frame=frame)
+                inserted = id_block.keyframe_insert(resolved_path, frame=frame)
+            if not inserted or not _verified_key(id_block, resolved_path, index, frame, value):
+                raise RuntimeError(f"Could not write a replacement key for {resolved_path} at frame {frame}.")
             keyframes += 1
 
         # Interpolation and handles are part of the RESULT, not decoration. The
@@ -200,6 +264,15 @@ def bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, prog
             if fcurve is not None:
                 kept, spec = smart_plan
                 smart_bake.apply_plan(fcurve, samples, kept, spec)
+
+    if remove_driver:
+        for owner, id_block, data_path, resolved_path, index, _samples in plans:
+            if index >= 0:
+                owner.driver_remove(data_path, index)
+            else:
+                owner.driver_remove(data_path)
+            if _find_driver(id_block, resolved_path, index) is not None:
+                raise RuntimeError(f"Could not remove the driver on {resolved_path}.")
 
     # Phase 3: the private helpers those drivers fed are now dead.
     #

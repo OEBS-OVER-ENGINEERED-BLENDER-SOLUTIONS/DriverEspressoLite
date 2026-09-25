@@ -28,9 +28,7 @@ STRUCTURAL_EFFECT = "STRUCTURAL_EFFECT"
 
 
 def _template(record):
-    extras = record.get("extras") if isinstance(record.get("extras"), dict) else {}
-    template_id = str(extras.get("template_id") or "")
-    return templates.TEMPLATE_BY_ID.get(template_id) or applied_motion.resolve_template(record)
+    return applied_motion.resolve_template(record)
 
 
 def effect_kind(record):
@@ -195,7 +193,7 @@ def _effect(host, host_label, record, resource_cache):
         # A spatial child can be edited or removed independently. Baking its
         # parent remains the only honest way to bake the composed field.
         "bakeable": not bool(child_kind),
-        "removable": True,
+        "removable": template is not None,
     }
 
 
@@ -425,6 +423,12 @@ def find_effect(context, record_token, source="ACTIVE"):
 
 _DRAW_CACHE = {}
 _DRAW_CACHE_SECONDS = 0.15
+
+
+def find_effect_for_draw(context, record_token, source="ACTIVE"):
+    """Read-only UI lookup. Operators must continue to use find_effect."""
+    return next((item for item in collect_effects_for_draw(context, source)
+                 if item["record_token"] == record_token), None)
 
 
 def collect_effects_for_draw(context, source="ACTIVE"):

@@ -91,6 +91,9 @@ def _classify(host, records):
     surviving, dead = [], []
     trimmed = 0
     for record in records:
+        if applied_motion.resolve_template(record) is None:
+            surviving.append(record)
+            continue
         paths = applied_motion.paths_of(record)
         if not paths:
             surviving.append(record)
@@ -221,6 +224,8 @@ def find_invalid(props, hosts):
         records = applied_motion.read(host)
         # Dead records and dead channels.
         for record in records:
+            if applied_motion.resolve_template(record) is None:
+                continue
             paths = applied_motion.paths_of(record)
             if not paths:
                 continue
@@ -280,6 +285,12 @@ def find_invalid(props, hosts):
 
 def remove_ghost(scene, props, host, data_path, index):
     """Delete one ghost driver, forgetting any controller binding first."""
+    for record in applied_motion.read(host):
+        if applied_motion.resolve_template(record) is not None:
+            continue
+        if any(path == data_path and (recorded < 0 or index < 0 or recorded == index)
+               for path, recorded in applied_motion.paths_of(record)):
+            return 0
     from ...ui.state import live_controls   # deliberate: the one UI reach,
                                             # for the binding rule it owns
     animation = getattr(host, "animation_data", None)

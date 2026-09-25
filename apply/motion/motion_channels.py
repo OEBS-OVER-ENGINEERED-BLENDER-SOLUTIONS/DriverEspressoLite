@@ -8,7 +8,7 @@ import uuid
 import bpy
 
 from . import applied_motion, stack_records, stack_runtime
-from ..core import apply_behavior, source_binding
+from ..core import apply_behavior, driver_manager, source_binding
 from ..setups import internal_helpers
 from ...catalogue import templates
 from ...engine import quaternion_channels as _qc
@@ -562,6 +562,20 @@ def _conflict_preflight(obj, targets, template):
     return decision
 
 
+def _foreign_motion_conflict(targets):
+    for target in targets:
+        foreign = driver_manager.foreign_live_motion_for_channel(
+            target.owner, target.data_path, target.index,
+        )
+        if foreign is not None:
+            return (
+                "%s[%d] has motion from an unavailable edition (%s); "
+                "it was left unchanged."
+                % (target.data_path, target.index, foreign["label"])
+            )
+    return ""
+
+
 def prepare_motion_template_application(
     obj,
     template,
@@ -728,6 +742,9 @@ def prepare_motion_template_application(
         valid, reason = _validate_plan(template, built_channels, targets, channels=filtered_channels)
         if not valid:
             return MotionApplyResult(False, reason)
+    foreign_conflict = _foreign_motion_conflict(targets)
+    if foreign_conflict:
+        return MotionApplyResult(False, foreign_conflict, targets=targets)
     conflict_decision = _conflict_preflight(obj, targets, template)
     if not conflict_decision.allowed:
         return MotionApplyResult(
@@ -845,6 +862,10 @@ def commit_prepared_motion(prepared_result):
     """Write a previously preflighted motion plan."""
     if not prepared_result.ok:
         return prepared_result
+
+    foreign_conflict = _foreign_motion_conflict(prepared_result.targets)
+    if foreign_conflict:
+        return MotionApplyResult(False, foreign_conflict, targets=prepared_result.targets)
 
     if prepared_result.helper_plans:
         return MotionApplyResult(False, "This edition cannot install motion helpers.")

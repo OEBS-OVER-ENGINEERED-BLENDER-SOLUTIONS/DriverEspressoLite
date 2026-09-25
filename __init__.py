@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Driver Espresso Lite",
     "author": "OEBS Studios",
-    "version": (1, 6, 3),
+    "version": (1, 6, 5),
     "blender": (4, 2, 0),
     "location": "View3D / Graph Editor > Sidebar > Espresso",
     "description": "Template-driven builder for native Blender motion systems.",

@@ -22,6 +22,7 @@ from ...apply import shared_material_sweep
 from ...apply import light_layout
 from ...apply import target_memory
 from ...apply import application_plan
+from ...apply.core import driver_manager as core_driver_manager
 from ...apply.setups import audio_reactivity
 from ...engine import utils
 from ...generated import helpers as generated_helpers
@@ -358,6 +359,33 @@ def resolve_button_multi_targets(context):
     return expand_multi_targets(clicked, multi_target_count(array_length))
 
 
+def _foreign_motion_on_button_targets(targets):
+    for target in targets:
+        owner = target.owner
+        root = getattr(owner, "id_data", None)
+        if root is None or root is owner:
+            root = owner
+            data_path = target.data_path
+        else:
+            prefix = owner.path_from_id()
+            data_path = "%s.%s" % (prefix, target.data_path) if prefix else target.data_path
+        animation = getattr(root, "animation_data", None)
+        if target.index < 0 and animation is not None:
+            indices = {curve.array_index for curve in animation.drivers
+                       if curve.data_path == data_path}
+        else:
+            indices = {target.index}
+        for index in indices:
+            foreign = core_driver_manager.foreign_live_motion_for_channel(
+                root, data_path, index,
+            )
+            if foreign is not None:
+                return "%s[%d] has motion from an unavailable edition (%s); it was left unchanged." % (
+                    data_path, index, foreign["label"],
+                )
+    return ""
+
+
 def apply_expression_to_targets(
     targets,
     expression,
@@ -394,6 +422,9 @@ def apply_expression_to_targets(
     report = application_plan.preflight(plan, source_status=source_status)
     if not report.ok:
         return False, report.errors[0], []
+    foreign_message = _foreign_motion_on_button_targets(targets)
+    if foreign_message:
+        return False, foreign_message, []
 
     applied = 0
     target_states = []
@@ -1042,6 +1073,28 @@ class ESPRESSO_OT_apply_to_selected_objects(bpy.types.Operator):
         if active in selected:                      # apply to the active FIRST
             selected.remove(active)
             selected.insert(0, active)
+        for obj in selected:
+            planned = []
+            for target in targets:
+                owner = equivalent_owner(target.owner, active, obj)
+                if owner is not None:
+                    planned.append(ButtonDriverTarget(owner, target.data_path, target.index))
+            if not planned:
+                continue
+            channels = template_catalogue.template_channels(template)
+            if template_catalogue.has_motion_plan(template) and len(channels) > 1:
+                motion_object = motion_channels.resolve_motion_object(planned[0].owner)
+                enabled = espresso_props.enabled_channel_ids_for_template(props, template)
+                if motion_object is not None:
+                    planned = [ButtonDriverTarget(motion_object, channel["data_path"],
+                                                   int(channel.get("index", -1)))
+                               for channel in channels
+                               if channel.get("data_path") and
+                               (enabled is None or channel.get("id") in enabled)]
+            foreign_message = _foreign_motion_on_button_targets(planned)
+            if foreign_message:
+                self.report({"WARNING"}, "%s: %s" % (obj.name, foreign_message))
+                return {"CANCELLED"}
         espresso_props.refresh_position_wave_auto_fit(props, context, selected)
 
         applied_all, states_all, skipped, done = [], [], [], 0
@@ -1687,6 +1740,12 @@ class ESPRESSO_OT_apply_pair_to_button(bpy.types.Operator):
             if not valid:
                 self.report({"WARNING"}, message)
                 return {"CANCELLED"}
+        foreign_message = _foreign_motion_on_button_targets(
+            [ButtonDriverTarget(owner, data_path, index) for index, _expression in plans]
+        )
+        if foreign_message:
+            self.report({"WARNING"}, foreign_message)
+            return {"CANCELLED"}
         applied = 0
         for index, expression in plans:
             try:
@@ -1814,6 +1873,13 @@ class ESPRESSO_OT_apply_channels_to_button(bpy.types.Operator):
             if not valid:
                 self.report({"WARNING"}, f"{channel.get('label', '')}: {message}")
                 return {"CANCELLED"}
+
+        foreign_message = _foreign_motion_on_button_targets(
+            [ButtonDriverTarget(owner, data_path, index) for index, _expression, _channel in plans]
+        )
+        if foreign_message:
+            self.report({"WARNING"}, foreign_message)
+            return {"CANCELLED"}
 
         applied = 0
         for index, expression, channel in plans:
@@ -2033,6 +2099,10 @@ def draw_button_context_menu(self, context):
 _BakeOptionsMixin = operators.BakeOptionsMixin
 
 
+from ...engine.baking.transaction import atomic_bake_operator
+
+
+@atomic_bake_operator
 class ESPRESSO_OT_apply_and_bake_to_button(_BakeOptionsMixin, bpy.types.Operator):
     bl_idname = "espresso.apply_and_bake_to_button"
     bl_label = "Apply and Bake Template"
@@ -2074,9 +2144,9 @@ class ESPRESSO_OT_apply_and_bake_to_button(_BakeOptionsMixin, bpy.types.Operator
         entry = target_memory.latest_entry(scene_props)
         targets = _entry_button_targets(entry)
         if not targets:
-            self.report({"WARNING"}, "Applied, but the new drivers could not be located to bake.")
+            self.report({"WARNING"}, "The new drivers could not be located to bake.")
             scene.frame_set(original_frame)
-            return {"FINISHED"}
+            return {"CANCELLED"}
         cleanup = target_memory.capture_cleanup_for_entry(entry, scene_props)
         wm = context.window_manager
         wm.progress_begin(0, 1)

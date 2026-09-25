@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "driver_espresso_lite"
-version = "1.6.3"
+version = "1.6.5"
 name = "Driver Espresso Lite"
 tagline = "A starter set of native Blender driver recipes"
 maintainer = "OEBS Studios"

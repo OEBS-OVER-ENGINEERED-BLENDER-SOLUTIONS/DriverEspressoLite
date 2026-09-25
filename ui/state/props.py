@@ -932,7 +932,7 @@ def live_or_latest_entry(context, template=None):
     return target_memory.latest_entry(props)
 
 
-def selected_live_effect(context):
+def selected_live_effect(context, *, for_draw=False):
     """Return the exact effect chosen in the Live picker, when it still exists."""
     props = getattr(getattr(context, "scene", None), "espresso_props", None)
     if props is None or getattr(props, "parameter_mode", "SETUP") != "LIVE":
@@ -943,10 +943,12 @@ def selected_live_effect(context):
     from ...apply.motion import applied_motion_manager
 
     source = getattr(props, "driver_target_source", "ACTIVE")
-    return applied_motion_manager.find_effect(context, token, source)
+    lookup = (applied_motion_manager.find_effect_for_draw if for_draw
+              else applied_motion_manager.find_effect)
+    return lookup(context, token, source)
 
 
-def live_parameter_template(context, fallback=None):
+def live_parameter_template(context, fallback=None, *, for_draw=False):
     """Parameter schema owned by the selected Live effect.
 
     Prepared structures use synthetic schemas that deliberately do not live in
@@ -955,16 +957,16 @@ def live_parameter_template(context, fallback=None):
     """
     props = getattr(getattr(context, "scene", None), "espresso_props", None)
     fallback = fallback or (get_current_template(props) if props else None)
-    effect = selected_live_effect(context)
+    effect = selected_live_effect(context, for_draw=for_draw)
     template = (effect or {}).get("template")
     return template if parameter_bindings.supports(template) else fallback
 
 
-def live_parameter_binding(context, template=None):
+def live_parameter_binding(context, template=None, *, for_draw=False):
     """Resolve the exact Live-picked effect, else the active compatible one."""
     props = getattr(getattr(context, "scene", None), "espresso_props", None)
     template = template or (get_current_template(props) if props else None)
-    effect = selected_live_effect(context)
+    effect = selected_live_effect(context, for_draw=for_draw)
     if effect is not None:
         bound = parameter_bindings.binding_for_effect(context, effect)
         if bound is not None and bound.available:

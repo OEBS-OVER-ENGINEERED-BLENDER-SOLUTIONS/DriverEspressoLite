@@ -222,6 +222,8 @@ def purge_emptied_records(context, host):
     live = {_record_identity(item) for item in applied_motion.entries(host)}
     purged = 0
     for record in list(applied_motion.read(host)):
+        if applied_motion.resolve_template(record) is None:
+            continue
         if not applied_motion.paths_of(record):
             continue
         if _record_identity(record) in live:
@@ -243,7 +245,8 @@ def purge_record(host, record):
     hand-deleted driver leaves no controller layer, support rig or node group
     standing behind it.
     """
-    _purge(host, record, remove_generated=True)
+    if applied_motion.resolve_template(record) is not None:
+        _purge(host, record, remove_generated=True)
 
 
 def expand_clear_snapshot_hosts(chosen):
@@ -297,7 +300,7 @@ def expand_clear_snapshot_hosts(chosen):
     return expanded
 
 
-def capture_clear_snapshot(chosen, *, extra_fcurve_owners=()):
+def capture_clear_snapshot(chosen, *, extra_fcurve_owners=(), defer_helper_cleanup=True):
     """Capture every CLEAR resource before holding copies can enter discovery.
 
     Holding clones intentionally keep Espresso identity so they can restore it.
@@ -355,7 +358,7 @@ def capture_clear_snapshot(chosen, *, extra_fcurve_owners=()):
             animation = getattr(host, 'animation_data', None)
             for curve in getattr(animation, 'drivers', ()) or ():
                 helper_resources.extend(internal_helpers.resources_from_driver(curve.driver))
-        if helper_resources:
+        if helper_resources and defer_helper_cleanup:
             # Rollback copies temporarily read these helpers. Retry their scoped
             # cleanup only after those copies go; restored artist drivers protect
             # the same resources when discard follows a rollback instead.
@@ -464,12 +467,23 @@ def bake_records(context, chosen, *, start, end, step=1, smart=False,
                  smart_tolerance=0.01, smart_passes=2):
     """Bake explicit records without re-resolving them from UI selection."""
     from ..views import guided_apply
-    from ...generated.core.transaction import GeneratedTransaction
+    from ...engine.baking.transaction import bake_transaction
 
     guided_apply.clear_preflight_cache()
 
     if not chosen:
         return False, "Choose at least one applied motion."
+
+    supported = [(host, record) for host, record in chosen
+                 if applied_motion.resolve_template(record) is not None]
+    skipped = len(chosen) - len(supported)
+    if not supported:
+        return False, "Selected motion is not available in this edition; it was left unchanged."
+    chosen = supported
+    skipped_message = (
+        " Skipped %d effect%s not available in this edition; left unchanged."
+        % (skipped, "" if skipped == 1 else "s")
+    ) if skipped else ""
 
     routed_motion, ordinary_motion = _classify_routes(chosen)
     if not routed_motion:
@@ -482,30 +496,33 @@ def bake_records(context, chosen, *, start, end, step=1, smart=False,
                 "Applied Motion to remove it instead."
             )
 
+    from ...engine import bake
+    targets = [target for host, record in ordinary_motion
+               for target in _targets_for(host, record)]
+    reason = bake.preflight_targets(targets)
+    if reason:
+        return False, reason
     try:
-        _snapshot_hosts, snapshot = capture_clear_snapshot(chosen)
-    except Exception as exc:
-        return False, "Bake cancelled before changes: snapshot could not be captured (%s)." % exc
-    try:
-        with GeneratedTransaction("bake-records") as owned:
-            owned.on_rollback(snapshot.restore)
+        with bake_transaction(context, targets=targets, chosen=chosen):
             messages = _bake_records_body(
                 context, chosen, start=start, end=end, step=step,
                 smart=smart, smart_tolerance=smart_tolerance,
                 smart_passes=smart_passes,
             )
-            owned.commit()
-        snapshot.discard()
     except Exception as exc:
-        snapshot.discard()
-        report = snapshot.verify()
-        if report.get("ok"):
-            return False, "Bake was rolled back: %s" % exc
-        detail = "; ".join(report.get("errors") or ())
-        if detail:
-            return False, "Bake failed and could not fully restore: %s (%s)" % (exc, detail)
-        return False, "Bake failed and could not fully restore: %s" % exc
-    return True, " ".join(messages)
+        return False, "Bake cancelled: %s" % exc
+    return True, " ".join(messages) + skipped_message
+
+
+def target_has_foreign_motion(target):
+    """Whether a driven channel belongs to a stamped, unavailable recipe."""
+    from ...apply.core import driver_manager
+
+    descriptor = target_memory.serialize_target(
+        target.owner, target.data_path, target.index,
+    )
+    metadata = driver_manager.metadata_for_descriptor(descriptor) if descriptor else None
+    return bool(metadata and applied_motion.resolve_template(metadata["record"]) is None)
 
 
 def _clear_records_body(context, chosen):
@@ -652,22 +669,8 @@ def _remove_attachments(host, code):
 
         aim_rig.clear_tracking(host, code)
         trajectory.clear_route(host, code)
-    # An orbit's drivers live on the pivot, so clearing reaches this function
-    # with the PIVOT as the host. Standing it back down at the camera is what
-    # returns the rig to being an ordinary support empty.
-    from ...apply.motion.camera import orbit as camera_orbit, support_rig
-
-    cameras = []
-    if getattr(host, "type", "") == "CAMERA":
-        cameras.append(host)
-    elif getattr(host, "type", "") == "EMPTY" and host.get(camera_orbit.PIVOT_TAG):
-        for child in list(getattr(host, "children", ()) or ()):
-            if getattr(child, "type", "") == "CAMERA" and support_rig.resolve_support_rig(child) is host:
-                camera_orbit.clear_pivot(child)
-                cameras.append(child)
-                break
-    for camera in cameras:
-        release_support_rig(camera)
+        release_support_rig(host)
+    # Lite creates no orbit pivots; ordinary Empty hosts need no rig teardown.
     # Lens drivers live on the Camera DATABLOCK, and the focus rig or dolly
     # reference they measure to is owned by the camera object using it.
     if isinstance(host, bpy.types.Camera):
@@ -755,18 +758,12 @@ def _remove_unreferenced_generated(record):
     objects, groups = generated_resources_for(record)
     for obj in objects:
         if not _is_referenced(obj):
-            try:
-                if generated_helpers.remove_empty(obj):
-                    removed += 1
-            except Exception:
-                pass
+            if generated_helpers.remove_empty(obj):
+                removed += 1
     for group in groups:
         if not _is_referenced(group):
-            try:
-                if generated_nodes.remove_group(group, require_unused=False):
-                    removed += 1
-            except Exception:
-                pass
+            if generated_nodes.remove_group(group, require_unused=False):
+                removed += 1
     return removed
 
 
@@ -801,16 +798,13 @@ def _discard_controller_bindings(host, record):
             targets.append(descriptor)
     if not targets:
         return
-    try:
-        live_controls.discard_bindings_for_targets(scene, props, targets)
-    except Exception:
-        # Cleanup is best-effort: a missing binding store must never stop the
-        # stamp and the helpers from being removed.
-        pass
+    live_controls.discard_bindings_for_targets(scene, props, targets)
 
 
 def _purge(host, record, remove_generated=True):
     """Remove one application's leftovers: helpers, generated data, stamp."""
+    if applied_motion.resolve_template(record) is None:
+        return
     _discard_controller_bindings(host, record)
     for key in applied_motion.helper_property_names(host, record):
         try:
@@ -899,9 +893,10 @@ class _BakeAppliedBase(BakeOptionsMixin):
             smart_passes=self.bake_smart_passes,
         )
         if not ok:
-            level = "WARNING" if message.startswith(
-                "The selected effect has no drivers to bake"
-            ) else "ERROR"
+            level = "WARNING" if message.startswith((
+                "The selected effect has no drivers to bake",
+                "Selected motion is not available in this edition",
+            )) else "ERROR"
             self.report({level}, message)
             return {"CANCELLED"}
         self.report({"INFO"}, message)

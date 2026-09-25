@@ -199,7 +199,8 @@ def discard_bindings_for_targets(scene, props, targets):
         binding = bindings.pop(_target_key(descriptor), None)
         if not binding:
             continue
-        _remove_carrier(scene, binding.get("carrier_path"))
+        for path in (binding.get("carrier_path"), *(binding.get("retired_carrier_paths") or ())):
+            _remove_carrier(scene, path)
         removed += 1
     if removed:
         write_bindings(props, bindings)
@@ -541,6 +542,202 @@ def _unsupported_template_reason(template):
     return ""
 
 
+def draft_base_snapshot(owner, base_snapshot, configure):
+    """Build a replacement driver on the same ID without touching its public channel."""
+    key = f"__espresso_draft_{uuid.uuid4().hex}"
+    path = f'["{key}"]'
+    owner[key] = 0.0
+    try:
+        fcurve = owner.driver_add(path)
+        if isinstance(fcurve, list):
+            fcurve = fcurve[0]
+        restore_driver(fcurve.driver, base_snapshot)
+        configure(fcurve.driver)
+        return snapshot_driver(fcurve.driver)
+    finally:
+        try:
+            owner.driver_remove(path)
+        finally:
+            del owner[key]
+
+
+def replace_base_snapshots(scene, props, replacements, template=None):
+    """Commit validated base recipes while preserving attached controller layers."""
+    from ...apply import driver_manager
+
+    bindings_before = getattr(props, "live_control_bindings", "{}")
+    bindings = read_bindings(props)
+    public_before = []
+    prepared = []
+    for item in replacements:
+        owner = item["owner"]
+        path = item["data_path"]
+        index = int(item["index"])
+        if index < 0:
+            return False, (
+                "Controller-aware Update needs one exact driver component; "
+                "reapply a specific component before updating."
+            )
+        if getattr(driver_manager, "foreign_live_motion_for_channel", lambda *_: None)(
+            owner, path, index,
+        ):
+            return False, f"An unavailable edition owns {path}[{index}]."
+        descriptor = target_memory.serialize_target(owner, path, index)
+        key = _target_key(descriptor)
+        binding = bindings.get(key)
+        animation = getattr(owner, "animation_data", None)
+        fcurve = animation.drivers.find(path, index=index) if animation else None
+        if binding and fcurve is None:
+            return False, f"The attached Controller driver at {path}[{index}] is missing."
+        controller = None
+        source = None
+        if binding:
+            if not isinstance(binding, dict) or not isinstance(binding.get("original"), dict):
+                return False, f"The Controller binding at {path}[{index}] is damaged."
+            controller = controller_by_uid(props, binding.get("controller_uid", ""))
+            if controller is None:
+                return False, "The attached Controller no longer exists."
+            source, reason = source_binding.resolve_source(controller.get("source"))
+            if source is None:
+                return False, reason or "The Controller input is unavailable."
+            signature = (binding.get("capture") or {}).get("source_signature")
+            if signature and signature != _source_signature(controller.get("source")):
+                return False, "The Controller input changed; reattach it before updating."
+            if item["base"].get("type") != "SCRIPTED":
+                return False, "Only scripted-expression drivers can use an Espresso Controller."
+            try:
+                compiled = live_control_core.compile_controlled_expression(
+                    item["base"].get("expression", ""),
+                    controller.get("interpretation", live_control_core.INTERPRET_SWITCH),
+                    float(binding["rest_value"]),
+                    threshold=controller.get("threshold", 0.5),
+                    invert=controller.get("invert", False),
+                    clamp=controller.get("clamp", True),
+                    response_curve=controller.get(
+                        "response_curve", live_control_core.RESPONSE_SMOOTH,
+                    ),
+                    transition_mode=controller.get(
+                        "transition_mode", live_control_core.TRANSITION_IMMEDIATE,
+                    ),
+                    transition_duration=controller.get("transition_duration", 0),
+                    capture_frame=int((binding.get("capture") or {}).get(
+                        "frame", scene.frame_current,
+                    )),
+                    frame_variable_name=FRAME_VARIABLE,
+                    max_length=utils.MAX_DRIVER_EXPRESSION_LENGTH,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                return False, f"Could not rebuild the Controller: {exc}"
+            if compiled["strategy"] == "CARRIER" and item["base"].get("use_self"):
+                return False, "This long driver uses Use Self and cannot move to a carrier."
+        else:
+            compiled = None
+        public_before.append({
+            "owner": owner, "path": path, "index": index,
+            "existed": fcurve is not None,
+            "snapshot": snapshot_driver(fcurve.driver) if fcurve else None,
+        })
+        prepared.append((item, key, binding, controller, source, compiled))
+
+    new_carriers = []
+    obsolete_carriers = []
+    try:
+        for item, key, old_binding, controller, source, compiled in prepared:
+            owner, path, index = item["owner"], item["data_path"], int(item["index"])
+            animation = getattr(owner, "animation_data", None)
+            fcurve = animation.drivers.find(path, index=index) if animation else None
+            if fcurve is None:
+                result = owner.driver_add(path, index) if index >= 0 else owner.driver_add(path)
+                fcurve = result[0] if isinstance(result, list) else result
+            base = item["base"]
+            if old_binding is None:
+                restore_driver(fcurve.driver, base)
+                continue
+            binding = copy.deepcopy(old_binding)
+            old_paths = {
+                value for value in (
+                    old_binding.get("carrier_path"),
+                    *(old_binding.get("retired_carrier_paths") or ()),
+                ) if value
+            }
+            carrier_path = ""
+            if compiled["strategy"] == "CARRIER":
+                carrier_path = _allocate_carrier(
+                    scene, f'{controller["uid"]}:{uuid.uuid4().hex[:8]}',
+                )
+                new_carriers.append(carrier_path)
+                carrier = _carrier_fcurve(scene, carrier_path)
+                restore_driver(carrier.driver, base)
+                restore_driver(fcurve.driver, {
+                    "type": "SCRIPTED", "expression": "0",
+                    "use_self": False, "variables": [],
+                })
+                _bind_single_prop(fcurve.driver, BASE_VARIABLE, {
+                    "id_type": "SCENE", "id": scene, "data_path": carrier_path,
+                })
+            else:
+                restore_driver(fcurve.driver, base)
+            _bind_single_prop(fcurve.driver, CONTROLLER_VARIABLE, source)
+            if controller.get("transition_mode") != live_control_core.TRANSITION_IMMEDIATE:
+                _bind_single_prop(fcurve.driver, FRAME_VARIABLE, {
+                    "id_type": "SCENE", "id": scene, "data_path": "frame_current",
+                })
+            _install_target_expression(fcurve.driver, compiled["expression"], scene)
+            enabled_driver = snapshot_driver(fcurve.driver)
+            binding["original"] = base
+            if template is not None:
+                binding["template_id"] = template.get("id", "")
+            binding["strategy"] = compiled["strategy"]
+            binding["carrier_path"] = carrier_path
+            if binding.get("disabled"):
+                old_public = next(
+                    value["snapshot"] for value in public_before
+                    if value["owner"] == owner
+                    and value["path"] == path and value["index"] == index
+                )
+                if not isinstance(binding.get("enabled_driver"), dict):
+                    raise ValueError("The disabled Controller has no resumable driver.")
+                binding["enabled_driver"] = enabled_driver
+                restore_driver(fcurve.driver, old_public)
+                retained = {
+                    target.get("data_path")
+                    for variable in old_public.get("variables", ())
+                    for target in variable.get("targets", ())
+                }
+                binding["retired_carrier_paths"] = sorted(old_paths & retained)
+            else:
+                binding.pop("retired_carrier_paths", None)
+            obsolete_carriers.extend(
+                old_paths - set(binding.get("retired_carrier_paths") or ()) - {carrier_path}
+            )
+            bindings[key] = binding
+        write_bindings(props, bindings)
+    except Exception as exc:
+        unrestored = 0
+        for item in public_before:
+            owner, path, index = item["owner"], item["path"], item["index"]
+            try:
+                if not item["existed"]:
+                    owner.driver_remove(path, index) if index >= 0 else owner.driver_remove(path)
+                else:
+                    animation = getattr(owner, "animation_data", None)
+                    fcurve = animation.drivers.find(path, index=index) if animation else None
+                    if fcurve is None:
+                        result = owner.driver_add(path, index) if index >= 0 else owner.driver_add(path)
+                        fcurve = result[0] if isinstance(result, list) else result
+                    restore_driver(fcurve.driver, item["snapshot"])
+            except Exception:
+                unrestored += 1
+        for path in new_carriers:
+            _remove_carrier(scene, path)
+        props.live_control_bindings = bindings_before
+        suffix = f" {unrestored} public driver(s) could not be restored." if unrestored else ""
+        return False, f"Controller-aware update was rolled back: {exc}.{suffix}"
+    for path in set(obsolete_carriers):
+        _remove_carrier(scene, path)
+    return True, "Updated the driver and its Controller."
+
+
 def attach_fcurves(
     scene,
     props,
@@ -596,6 +793,8 @@ def attach_fcurves(
                     )
             if old_binding and old_binding.get("carrier_path"):
                 stale_carriers.append(old_binding["carrier_path"])
+            if old_binding:
+                stale_carriers.extend(old_binding.get("retired_carrier_paths") or ())
 
             if reset_mode == RESET_BASELINE:
                 if baseline_value is None:
@@ -736,7 +935,8 @@ def remove_fcurves(scene, props, fcurves):
         return False, f"Controller removal was rolled back: {exc}", 0
     write_bindings(props, bindings)
     for binding in removed:
-        _remove_carrier(scene, binding.get("carrier_path"))
+        for path in (binding.get("carrier_path"), *(binding.get("retired_carrier_paths") or ())):
+            _remove_carrier(scene, path)
     if not removed:
         return False, "The selected scope has no attached Espresso Controller.", 0
     return True, f"Removed controller from {len(removed)} driver(s).", len(removed)
@@ -758,6 +958,7 @@ def set_fcurves_enabled(scene, props, fcurves, enabled, template):
     bindings = read_bindings(props)
     snapshots = [(fcurve, snapshot_driver(fcurve.driver)) for fcurve in fcurves]
     changed = 0
+    retired_carriers = []
     try:
         for fcurve in fcurves:
             descriptor = _target_descriptor(fcurve)
@@ -771,6 +972,7 @@ def set_fcurves_enabled(scene, props, fcurves, enabled, template):
                 restore_driver(fcurve.driver, binding["enabled_driver"])
                 binding.pop("enabled_driver", None)
                 binding["disabled"] = False
+                retired_carriers.extend(binding.pop("retired_carrier_paths", ()))
             else:
                 if binding.get("disabled"):
                     continue
@@ -816,6 +1018,8 @@ def set_fcurves_enabled(scene, props, fcurves, enabled, template):
         state = "disabled" if enabled else "enabled"
         return False, f"No {state} Controller was found in this scope.", 0
     write_bindings(props, bindings)
+    for path in set(retired_carriers):
+        _remove_carrier(scene, path)
     action = "Enabled" if enabled else "Captured and safely disabled"
     return True, f"{action} {changed} controlled driver(s).", changed
 
@@ -1224,7 +1428,8 @@ def delete_controller(scene, props, uid):
     bindings = read_bindings(props)
     for key, item in matching.items():
         if key in bindings:
-            _remove_carrier(scene, item.get("carrier_path"))
+            for path in (item.get("carrier_path"), *(item.get("retired_carrier_paths") or ())):
+                _remove_carrier(scene, path)
             bindings.pop(key, None)
     write_bindings(props, bindings)
     controllers = [item for item in read_controllers(props) if item["uid"] != uid]

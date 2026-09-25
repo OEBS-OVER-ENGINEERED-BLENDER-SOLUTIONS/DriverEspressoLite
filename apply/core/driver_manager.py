@@ -336,9 +336,28 @@ def metadata_for_descriptor(target):
         "parameter_values": dict(values or {}),
         "entry": entry,
         "editable": editable,
+        "removable": template is not None,
         "effect_kind": effect_kind,
         "record_token": applied_motion.entry_token(host, record),
     }
+
+
+def foreign_live_motion_for_channel(owner, data_path, index):
+    """Return a live channel's unavailable applied-motion metadata, if any."""
+    animation = getattr(owner, "animation_data", None)
+    if animation is None:
+        return None
+    curve = (
+        animation.drivers.find(data_path, index=index)
+        if index >= 0 else animation.drivers.find(data_path)
+    )
+    if curve is None:
+        return None
+    descriptor = target_memory.serialize_target(owner, data_path, index)
+    metadata = metadata_for_descriptor(descriptor) if descriptor else None
+    if metadata and applied_motion.resolve_template(metadata["record"]) is None:
+        return metadata
+    return None
 
 
 def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
@@ -371,7 +390,10 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
             "editable": bool(metadata and metadata["editable"]),
             "record_token": metadata["record_token"] if metadata else "",
             "effect_kind": metadata["effect_kind"] if metadata else "SINGLE_PROPERTY",
-            "batch_eligible": bool(not metadata or metadata["effect_kind"] == "SINGLE_PROPERTY"),
+            "batch_eligible": bool(
+                not metadata or (metadata["removable"]
+                                 and metadata["effect_kind"] == "SINGLE_PROPERTY")
+            ),
             "badge_text": "", "member_count": 0,
             "nest_depth": 0,
         })

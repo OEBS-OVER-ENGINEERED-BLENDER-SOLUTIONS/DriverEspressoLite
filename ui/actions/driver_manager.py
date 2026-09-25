@@ -179,6 +179,10 @@ def remove_selected_with_rollback(context, descriptors, effect_tokens, props):
     plain = []
     for descriptor in descriptors:
         metadata = driver_manager.metadata_for_descriptor(descriptor)
+        if metadata is not None and applied_motion.resolve_template(
+            metadata["record"],
+        ) is None:
+            return False, "Selected motion is not available in this edition; it was left unchanged.", {}
         route = (
             bake_applied.route_for_record(metadata["host"], metadata["record"])
             if metadata else None
@@ -203,6 +207,9 @@ def remove_selected_with_rollback(context, descriptors, effect_tokens, props):
     ]
     if any(effect is None for effect in effects):
         return False, "A checked applied effect no longer exists; nothing was removed.", {}
+    if any(applied_motion.resolve_template(effect["record"]) is None
+           for effect in effects if effect.get("record")):
+        return False, "Selected motion is not available in this edition; it was left unchanged.", {}
 
     # STRUCTURAL_EFFECT alone is no longer enough to mean "prepared layout".
     # An authoring rig is filed as a structure too -- correctly, it is the thing

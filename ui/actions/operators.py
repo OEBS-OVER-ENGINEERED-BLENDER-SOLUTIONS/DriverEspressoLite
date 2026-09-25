@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 import bpy
+from ...engine.baking.transaction import atomic_bake_operator
 
 from ...apply import apply_behavior
 from ...apply import applied_motion
@@ -1256,6 +1257,7 @@ class ESPRESSO_OT_apply_pose_as_motion(bpy.types.Operator):
         return {"FINISHED"}
 
 
+@atomic_bake_operator
 class ESPRESSO_OT_bake_drivers(bpy.types.Operator):
     """Bake ANY driver to keyframes, not only ones this add-on applied.
 
@@ -1300,6 +1302,7 @@ class ESPRESSO_OT_bake_drivers(bpy.types.Operator):
             "drivers must either go or be muted for a bake to be visible"
         ),
     )
+    foreign_skipped: bpy.props.IntProperty(default=0, options={"HIDDEN"})
 
     @classmethod
     def poll(cls, context):
@@ -1315,15 +1318,28 @@ class ESPRESSO_OT_bake_drivers(bpy.types.Operator):
     def _discover(self, context):
         from ...engine import bake
         from ...apply import internal_helpers
+        from . import bake_applied
 
         targets, unresolved = bake.discover_driver_targets(
             self._objects(context),
             scene=context.scene if self.scope == "SCENE" else None,
         )
-        return [
+        discovered = [
             target for target in targets
             if not internal_helpers.is_owned_path(target.data_path)
-        ], unresolved
+        ]
+        supported = [target for target in discovered
+                     if not bake_applied.target_has_foreign_motion(target)]
+        self.foreign_skipped = len(discovered) - len(supported)
+        return supported, unresolved
+
+    def _bake_preflight(self, context, targets):
+        if not targets and self.foreign_skipped:
+            return (
+                "%d driver(s) belong to motion not available in this edition; left unchanged."
+                % self.foreign_skipped
+            )
+        return ""
 
     def invoke(self, context, event):
         self.frame_start = context.scene.frame_start
@@ -1361,13 +1377,21 @@ class ESPRESSO_OT_bake_drivers(bpy.types.Operator):
         if unresolved:
             box.label(text="%d driver(s) point at a missing property and will be skipped"
                            % unresolved, icon="ERROR")
+        if self.foreign_skipped:
+            box.label(text="%d driver(s) belong to unavailable motion and will be skipped"
+                           % self.foreign_skipped, icon="INFO")
 
     def execute(self, context):
         from ...engine import bake
 
         targets, unresolved = self._discover(context)
         if not targets:
-            self.report({"WARNING"}, "No drivers found in this scope.")
+            message = (
+                "%d driver(s) belong to motion not available in this edition; left unchanged."
+                % self.foreign_skipped
+                if self.foreign_skipped else "No drivers found in this scope."
+            )
+            self.report({"WARNING"}, message)
             return {"CANCELLED"}
 
         props = getattr(context.scene, "espresso_props", None)
@@ -1408,7 +1432,9 @@ class ESPRESSO_OT_bake_drivers(bpy.types.Operator):
                 target_memory.clear_latest_entry(props)
         if unresolved:
             message += " Skipped %d driver(s) pointing at a missing property." % unresolved
-        self.report({"WARNING"} if unresolved else {"INFO"}, message)
+        if self.foreign_skipped:
+            message += " Skipped %d driver(s) belonging to motion not available in this edition." % self.foreign_skipped
+        self.report({"WARNING"} if unresolved or self.foreign_skipped else {"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -1670,6 +1696,7 @@ class BakeOptionsMixin:
         # keeps winning and the keys sit dead underneath.
 
 
+@atomic_bake_operator
 class ESPRESSO_OT_bake_last_target(BakeOptionsMixin, bpy.types.Operator):
     """Freeze the drivers from the last apply, without re-applying anything.
 
@@ -1733,6 +1760,18 @@ class ESPRESSO_OT_bake_last_target(BakeOptionsMixin, bpy.types.Operator):
                        % (len(targets), frames, len(targets) * frames),
                   icon="KEYFRAME_HLT")
 
+    def _bake_preflight(self, context, targets):
+        from . import bake_applied
+
+        props = context.scene.espresso_props
+        entry = target_memory.latest_entry(props) or {}
+        template_id = str(entry.get("template_id") or "")
+        if template_id and template_id not in templates.TEMPLATE_BY_ID:
+            return "Last motion is not available in this edition; it was left unchanged."
+        if any(bake_applied.target_has_foreign_motion(target) for target in targets):
+            return "Last motion is not available in this edition; it was left unchanged."
+        return ""
+
     def execute(self, context):
         self._commit_range(context)
         from ...engine import bake
@@ -1757,6 +1796,11 @@ class ESPRESSO_OT_bake_last_target(BakeOptionsMixin, bpy.types.Operator):
         ]
         if not targets:
             self.report({"WARNING"}, "The last apply's channels could not be located to bake.")
+            return {"CANCELLED"}
+
+        reason = self._bake_preflight(context, targets)
+        if reason:
+            self.report({"WARNING"}, reason)
             return {"CANCELLED"}
 
         cleanup = target_memory.capture_cleanup_for_entry(entry, props)
@@ -1793,10 +1837,7 @@ class ESPRESSO_OT_bake_last_target(BakeOptionsMixin, bpy.types.Operator):
             if host is not None:
                 hosts.setdefault(id(host), host)
         for host in hosts.values():
-            try:
-                applied_motion.prune(host)
-            except Exception:
-                pass
+            applied_motion.prune(host)
 
         # The remembered entry described a LIVE driver that no longer exists, so
         # leaving it would let Update Last Target and Clear Last Drivers act on
@@ -1807,6 +1848,7 @@ class ESPRESSO_OT_bake_last_target(BakeOptionsMixin, bpy.types.Operator):
         return {"FINISHED"}
 
 
+@atomic_bake_operator
 class ESPRESSO_OT_apply_and_bake_motion(BakeOptionsMixin, bpy.types.Operator):
     bl_idname = "espresso.apply_and_bake_motion"
     bl_label = "Apply and Bake Motion"
@@ -1855,9 +1897,9 @@ class ESPRESSO_OT_apply_and_bake_motion(BakeOptionsMixin, bpy.types.Operator):
             for item in (resolved or []) if item.get("owner") is not None
         ]
         if not targets:
-            self.report({"WARNING"}, "Motion applied, but its channels could not be located to bake.")
+            self.report({"WARNING"}, "The applied channels could not be located to bake.")
             scene.frame_set(original_frame)
-            return {"FINISHED"}
+            return {"CANCELLED"}
         cleanup = target_memory.capture_cleanup_for_entry(entry, props)
         wm = context.window_manager
         wm.progress_begin(0, 1)
@@ -2440,6 +2482,20 @@ def _reapply_channel_plan_to_entry(context, props, template, entry):
     if not resolved:
         return False, reason or "The remembered target no longer exists."
 
+    from ...apply import driver_manager
+
+    for target in resolved:
+        channel, reason = target_memory.canonical_driver_channel(target)
+        if channel is None:
+            return False, reason
+        foreign = getattr(
+            driver_manager, "foreign_live_motion_for_channel", lambda *_: None,
+        )(
+            channel["owner"], channel["data_path"], channel["index"],
+        )
+        if foreign:
+            return False, "A remembered channel belongs to an unavailable edition."
+
     channels = templates.template_channels(template)
     by_index = {}
     for channel, built in zip(channels, espresso_props.built_channel_previews(props)):
@@ -2614,6 +2670,37 @@ class ESPRESSO_OT_update_last_target(bpy.types.Operator):
             self.report({"WARNING"}, message)
             return {"CANCELLED"}
 
+        from ..state import live_controls
+
+        resolved_targets, _reason = target_memory.resolve_entry(entry)
+        bound_keys = live_controls.read_bindings(props)
+        has_controller = False
+        for target in resolved_targets or ():
+            channel, reason = target_memory.canonical_driver_channel(target)
+            if channel is None:
+                espresso_props.set_last_apply_status(props, reason)
+                self.report({"WARNING"}, reason)
+                return {"CANCELLED"}
+            key = live_controls._target_key(target_memory.serialize_target(
+                channel["owner"], channel["data_path"], channel["index"],
+            ))
+            fcurve = target_memory._find_owner_driver(
+                channel["owner"], channel["data_path"], channel["index"],
+            )
+            if target_memory._controller_binding_issue(
+                fcurve, bound_keys.get(key), binding_present=key in bound_keys,
+            ):
+                message = "A Controller binding is missing or damaged; the motion was left unchanged."
+                espresso_props.set_last_apply_status(props, message)
+                self.report({"WARNING"}, message)
+                return {"CANCELLED"}
+            has_controller = has_controller or key in bound_keys
+        if has_controller and transition != application_plan.SAME_SCOPE:
+            message = "Remove the attached Controller before changing this target's scope."
+            espresso_props.set_last_apply_status(props, message)
+            self.report({"WARNING"}, message)
+            return {"CANCELLED"}
+
         if transition == application_plan.MOTION_TO_SINGLE:
             ok, message, converted = target_memory.convert_motion_entry_to_single(
                 entry,
@@ -2656,6 +2743,46 @@ class ESPRESSO_OT_update_last_target(bpy.types.Operator):
         # props.preview at every remembered target would write the first
         # channel's formula onto all of them. Re-run the motion plan instead.
         if templates.has_motion_plan(template):
+            if has_controller:
+                if template.get("internal_helpers") or template.get("sample_internal_helpers"):
+                    message = "This helper-based motion cannot be rebuilt under an attached Controller."
+                    espresso_props.set_last_apply_status(props, message)
+                    self.report({"WARNING"}, message)
+                    return {"CANCELLED"}
+                values = espresso_props.collect_values(props, template)
+                built = utils.build_template_expressions(template, values, context.scene)
+                matched, note = motion_channels.channels_for_stored_targets(
+                    built, template, context.scene, (entry or {}).get("targets") or (),
+                    values=values,
+                    enabled_channel_ids=espresso_props.enabled_channel_ids_for_template(
+                        props, template,
+                    ),
+                )
+                if matched is None:
+                    espresso_props.set_last_apply_status(props, note)
+                    self.report({"WARNING"}, note)
+                    return {"CANCELLED"}
+                ok, message = target_memory.apply_expression_to_entry(
+                    entry, [item["expression"] for item in matched], template,
+                    source_entry=source_binding.latest_source(props),
+                    scene=context.scene,
+                    rest_start_mode=espresso_props.effective_rest_start_mode(props),
+                    output_baseline=[item.get("output_baseline") for item in matched],
+                    validation_template=audio_reactivity.validation_template(
+                        template, context.scene,
+                    ),
+                    prepare_driver=lambda driver: audio_reactivity.prepare_driver(
+                        driver, template, context.scene,
+                    ),
+                )
+                espresso_props.set_last_apply_status(props, message)
+                if not ok:
+                    self.report({"WARNING"}, message)
+                    return {"CANCELLED"}
+                entry["parameter_values"] = target_memory.json_safe_values(values)
+                target_memory.remember_entry(context, entry)
+                self.report({"INFO"}, message if not note else f"{message} {note}")
+                return {"FINISHED"}
             obj, pose_bone, reason = _entry_motion_context(entry)
             if obj is None:
                 # No object behind the remembered targets - a shader socket, say.
@@ -3366,6 +3493,11 @@ class ESPRESSO_OT_remove_driver(bpy.types.Operator):
             core_driver_manager.metadata_for_descriptor(descriptor)
             if descriptor else None
         )
+        if metadata is not None and applied_motion.resolve_template(
+            metadata["record"],
+        ) is None:
+            self.report({"WARNING"}, "Selected motion is not available in this edition; it was left unchanged.")
+            return {"CANCELLED"}
         if metadata is not None and bake_applied.route_for_record(
             metadata["host"], metadata["record"],
         ) is not None:

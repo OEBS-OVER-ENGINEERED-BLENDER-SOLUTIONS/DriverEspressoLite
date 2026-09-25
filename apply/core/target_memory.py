@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import time
+from types import SimpleNamespace
 
 import bpy
 
@@ -753,6 +754,39 @@ def resolve_entry(entry):
     return resolved, ""
 
 
+def canonical_driver_channel(target):
+    """Locate the actual ID-owned F-Curve for a remembered RNA target."""
+    owner = target["owner"]
+    path = target["data_path"]
+    index = int(target["index"])
+    driver_owner = getattr(owner, "id_data", None) or owner
+    if driver_owner is not owner:
+        try:
+            path = owner.path_from_id(path)
+        except (AttributeError, TypeError, ValueError):
+            return None, "The remembered target's driver path is unavailable."
+    animation = getattr(driver_owner, "animation_data", None)
+    drivers = getattr(animation, "drivers", ()) if animation else ()
+    if index < 0:
+        try:
+            property_length = len(driver_owner.path_resolve(path))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            property_length = 0
+        if property_length > 1:
+            return None, (
+                "The remembered whole-property target is an array. "
+                "Reapply a specific component before updating."
+            )
+        matches = [curve for curve in drivers if curve.data_path == path]
+        if len(matches) != 1:
+            return None, (
+                "The remembered whole-property target does not identify exactly "
+                "one live driver channel. Reapply a specific component instead."
+            )
+        index = int(matches[0].array_index)
+    return {"owner": driver_owner, "data_path": path, "index": index}, ""
+
+
 def capture_cleanup_for_fcurves(fcurves, props=None):
     """Inventory owned helpers before public F-Curves disappear."""
     from ..setups import internal_helpers
@@ -866,6 +900,41 @@ def apply_expression_to_entry(
     resolved, reason = resolve_entry(entry)
     if not resolved:
         return False, reason
+    canonical_targets = []
+    for target in resolved:
+        channel, reason = canonical_driver_channel(target)
+        if channel is None:
+            return False, reason
+        canonical_targets.append(channel)
+    scene = scene or bpy.context.scene
+    registered_props = getattr(scene, "espresso_props", None)
+    if registered_props is None:
+        if len(canonical_targets) != 1:
+            return False, "Register Driver Espresso before updating multiple targets."
+        from ...ui.state import live_controls
+
+        channel = canonical_targets[0]
+        curve = _find_owner_driver(
+            channel["owner"], channel["data_path"], channel["index"],
+        )
+        controller_names = {
+            live_controls.CONTROLLER_VARIABLE,
+            live_controls.BASE_VARIABLE,
+        }
+        has_controller_marker = bool(
+            curve and any(
+                variable.name in controller_names
+                for variable in curve.driver.variables
+            )
+        )
+        has_carrier = any(
+            str(key).startswith("__espresso_carrier_") for key in scene.keys()
+        )
+        if has_controller_marker or has_carrier:
+            return False, (
+                "Register Driver Espresso before updating a possible "
+                "Controller-bound target."
+            )
     expressions = list(expression) if isinstance(expression, (list, tuple)) else [expression] * len(resolved)
     baselines = (
         list(output_baseline) if isinstance(output_baseline, (list, tuple))
@@ -877,7 +946,16 @@ def apply_expression_to_entry(
         (target.get("rest_state") or {}).get("pose_delta") is not None
         for target in resolved
     )
-    if len(resolved) > 1 and not template.get("channels") and not pose_driven:
+    from . import application_plan
+
+    scalar_broadcast = (
+        application_plan.infer_scope(entry) == application_plan.BROADCAST
+        and not template.get("channels")
+    )
+    if (
+        len(resolved) > 1 and not template.get("channels")
+        and not pose_driven and not scalar_broadcast
+    ):
         label = entry.get("display_label", "the remembered target")
         return False, (
             f"{label} was applied across several channels, so a single-value "
@@ -886,7 +964,6 @@ def apply_expression_to_entry(
             "again. Its drivers are not affected."
         )
 
-    fcurves = []
     prepared = []
     for target_index, target in enumerate(resolved):
         owner = target["owner"]
@@ -992,109 +1069,87 @@ def apply_expression_to_entry(
             return False, message
         prepared.append(wrapped_expression)
 
-    # One motion set is one user operation. Snapshot every driver only after
-    # every replacement expression validates, then restore the complete set if
-    # a later variable binding or assignment fails on any channel.
+    # Build every replacement on a private driver first, then commit the whole
+    # remembered set with its controller bindings in one transaction.
     from ...ui.state import live_controls
+    from . import driver_manager, source_binding
 
-    snapshots = []
-    for target in resolved:
-        owner = target["owner"]
-        data_path = target["data_path"]
-        index = int(target["index"])
-        animation = getattr(owner, "animation_data", None)
-        curve = (
-            animation.drivers.find(data_path, index=index)
-            if animation is not None else None
+    props = (
+        registered_props if registered_props is not None
+        else SimpleNamespace(live_control_bindings="{}")
+    )
+    bindings = live_controls.read_bindings(props)
+    required = [var["name"] for var in template.get("requires_driver_variables", [])]
+    replacements = []
+    for target, wrapped_expression in zip(canonical_targets, prepared):
+        owner, data_path, index = (
+            target["owner"], target["data_path"], int(target["index"])
         )
-        snapshots.append({
-            "owner": owner,
-            "data_path": data_path,
-            "index": index,
-            "existed": curve is not None,
-            "snapshot": (
-                live_controls.snapshot_driver(curve.driver)
-                if curve is not None else None
-            ),
+        foreign = getattr(
+            driver_manager, "foreign_live_motion_for_channel", lambda *_: None,
+        )(owner, data_path, index)
+        if foreign:
+            entry["targets"] = original_target_records
+            return False, f"An unavailable edition owns {data_path}[{index}]."
+        descriptor = serialize_target(owner, data_path, index)
+        binding = bindings.get(live_controls._target_key(descriptor))
+        fcurve = _find_owner_driver(owner, data_path, index)
+        if _controller_binding_issue(
+            fcurve, binding, binding_present=live_controls._target_key(descriptor) in bindings,
+        ):
+            entry["targets"] = original_target_records
+            return False, (
+                f"The Controller binding at {data_path}[{index}] is missing or damaged; "
+                "the driver was left unchanged."
+            )
+        base = (
+            binding.get("original") if isinstance(binding, dict) else None
+        ) or (
+            live_controls.snapshot_driver(fcurve.driver) if fcurve else
+            {"type": "SCRIPTED", "expression": "0", "use_self": False, "variables": []}
+        )
+
+        def configure(driver, expression=wrapped_expression):
+            if required:
+                existing = {item.name for item in driver.variables}
+                missing = [name for name in required if name not in existing]
+                if missing or source_entry:
+                    ok, message = source_binding.bind_required_variables(
+                        driver, template, source_entry,
+                    )
+                    if not ok:
+                        raise ValueError(
+                            message or "Add required driver variable(s) first: "
+                            + ", ".join(missing)
+                        )
+            if prepare_driver is not None:
+                result = prepare_driver(driver)
+                if isinstance(result, tuple) and not result[0]:
+                    raise ValueError(result[1])
+                if result is False:
+                    raise ValueError("Could not prepare the remembered driver route.")
+            ok, message = utils.assign_driver_expression(
+                driver, expression, validation_template or template, scene,
+            )
+            if not ok:
+                raise ValueError(message)
+
+        try:
+            new_base = live_controls.draft_base_snapshot(owner, base, configure)
+        except Exception as exc:
+            entry["targets"] = original_target_records
+            return False, f"Could not update {data_path}[{index}]: {exc}"
+        replacements.append({
+            "owner": owner, "data_path": data_path, "index": index, "base": new_base,
         })
 
-    def rollback(message):
+    ok, message = live_controls.replace_base_snapshots(
+        scene, props, replacements, template=template,
+    )
+    if not ok:
         entry["targets"] = original_target_records
-        for item in snapshots:
-            owner = item["owner"]
-            data_path = item["data_path"]
-            index = item["index"]
-            animation = getattr(owner, "animation_data", None)
-            curve = (
-                animation.drivers.find(data_path, index=index)
-                if animation is not None else None
-            )
-            if not item["existed"]:
-                try:
-                    if index >= 0:
-                        owner.driver_remove(data_path, index)
-                    else:
-                        owner.driver_remove(data_path)
-                except (RuntimeError, TypeError):
-                    pass
-                continue
-            if curve is None:
-                try:
-                    curve = (
-                        owner.driver_add(data_path, index)
-                        if index >= 0 else owner.driver_add(data_path)
-                    )
-                except (RuntimeError, TypeError):
-                    curve = None
-            if curve is not None:
-                live_controls.restore_driver(curve.driver, item["snapshot"])
         return False, message
-
-    for target in resolved:
-        owner = target["owner"]
-        data_path = target["data_path"]
-        index = int(target["index"])
-        try:
-            result = owner.driver_add(data_path, index)
-        except TypeError:
-            result = owner.driver_add(data_path)
-        except Exception as exc:
-            return rollback(f"Could not update last target {data_path}: {exc}")
-
-        target_fcurves = result if isinstance(result, list) else [result]
-        for fcurve in target_fcurves:
-            if fcurve is not None:
-                fcurves.append(fcurve)
-
-    if not fcurves:
-        return rollback("Last target no longer exists or is not drivable.")
-
-    required = [var["name"] for var in template.get("requires_driver_variables", [])]
-    if required:
-        for fcurve in fcurves:
-            existing = {item.name for item in fcurve.driver.variables}
-            missing = [name for name in required if name not in existing]
-            if missing or source_entry:
-                from . import source_binding
-
-                ok, message = source_binding.bind_required_variables(fcurve.driver, template, source_entry)
-                if not ok:
-                    return rollback(message or "Add required driver variable(s) first: " + ", ".join(missing))
-
-    for fcurve, wrapped_expression in zip(fcurves, prepared):
-        if prepare_driver is not None:
-            result = prepare_driver(fcurve.driver)
-            if isinstance(result, tuple) and not result[0]:
-                return rollback(result[1])
-            if result is False:
-                return rollback("Could not prepare the remembered driver route.")
-        ok, message = utils.assign_driver_expression(
-            fcurve.driver, wrapped_expression, validation_template or template, scene,
-        )
-        if not ok:
-            return rollback(message)
-
-    count = len(fcurves)
+    count = len(replacements)
     message = "Updated last target." if count == 1 else f"Updated {count} target channels."
     return True, message
 
@@ -1106,6 +1161,41 @@ def _find_owner_driver(owner, data_path, index):
     if index >= 0:
         return animation.drivers.find(data_path, index=index)
     return animation.drivers.find(data_path)
+
+
+def _controller_binding_issue(fcurve, binding, *, binding_present=False):
+    """Whether a public driver and its Controller record disagree."""
+    from ...ui.state import live_controls
+
+    if fcurve is None:
+        return binding_present
+    names = {variable.name for variable in fcurve.driver.variables}
+    controller = live_controls.CONTROLLER_VARIABLE
+    base = live_controls.BASE_VARIABLE
+    if not binding_present:
+        return bool(names & {controller, base})
+    if not isinstance(binding, dict) or not binding:
+        return True
+    if controller not in names:
+        return True
+    if binding.get("disabled"):
+        enabled = binding.get("enabled_driver")
+        if not isinstance(enabled, dict):
+            return True
+        expression = enabled.get("expression")
+        variables = enabled.get("variables")
+        if not isinstance(expression, str) or not isinstance(variables, list):
+            return True
+        if any(
+            not isinstance(variable, dict)
+            or not isinstance(variable.get("name"), str)
+            for variable in variables
+        ):
+            return True
+        return controller not in expression or not any(
+            variable["name"] == controller for variable in variables
+        )
+    return controller not in fcurve.driver.expression
 
 
 def _snapshot_resolved_drivers(resolved):
@@ -1156,6 +1246,17 @@ def remove_driver_from_entry(entry, context=None):
     resolved, reason = resolve_entry(entry)
     if not resolved:
         return False, reason
+
+    for target in resolved:
+        owner = target["owner"]
+        data_path = target["data_path"]
+        index = int(target["index"])
+        for record in applied_motion.read(owner):
+            if applied_motion.resolve_template(record) is not None:
+                continue
+            if any(path == data_path and (recorded < 0 or index < 0 or recorded == index)
+                   for path, recorded in applied_motion.paths_of(record)):
+                return False, "Selected motion is not available in this edition; it was left unchanged."
 
     context = context or bpy.context
     props = getattr(getattr(context, "scene", None), "espresso_props", None)

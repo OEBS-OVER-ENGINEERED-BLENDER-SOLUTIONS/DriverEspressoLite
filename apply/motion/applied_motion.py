@@ -236,6 +236,9 @@ def prune(host):
         return 0
     keep = []
     for record in records:
+        if resolve_template(record) is None:
+            keep.append(record)
+            continue
         paths = _paths_of(record)
         if not paths or any(_has_live_driver(host, path, i) for path, i in paths):
             keep.append(record)

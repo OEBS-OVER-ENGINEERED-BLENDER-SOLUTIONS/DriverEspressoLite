@@ -17,6 +17,8 @@ from ...apply import applied_motion
 from ...apply.core import target_memory
 from . import attachments as generated_attachments
 from . import constraint_snapshot
+from . import fcurve_snapshot
+from . import node_graph_snapshot
 
 
 _HOLDING_PREFIX = "__espresso_clear_rollback_"
@@ -41,7 +43,26 @@ def _id_alive(block):
 
 
 def _host_key(block):
-    return "%s:%s" % (block.__class__.__name__, getattr(block, "name", ""))
+    owner = _owner_identity(block)
+    return tuple(owner.get(key, '') for key in ('id_type', 'id_name', 'library', 'owner_path'))
+
+
+def _owner_identity(block):
+    owner = target_memory.serialize_owner(block)
+    parent, _path = target_memory._embedded_node_tree_parent(block)
+    owner['library'] = target_memory.library_filepath(parent if parent is not None else block)
+    return owner
+
+
+def _resolve_owner(identity):
+    root = target_memory.find_id_block(identity['id_type'], identity['id_name'], identity.get('library', ''))
+    if root is None or target_memory.library_filepath(root) != identity.get('library', ''):
+        return None
+    path = identity.get('owner_path', '')
+    try:
+        return root.path_resolve(path) if path else root
+    except (ValueError, AttributeError, ReferenceError):
+        return None
 
 
 def _remove_driver(owner, data_path, index):
@@ -167,6 +188,8 @@ def _verify_drivers(owner, records, label, errors):
         errors.extend(
             _driver_snapshot_errors(expected, actual, "%s on %s" % (data_path, label))
         )
+        if "fcurve" in driver:
+            errors.extend(fcurve_snapshot.errors(curve, driver["fcurve"], "%s on %s" % (data_path, label)))
 
 
 def _captured_modifiers(obj):
@@ -247,6 +270,7 @@ def _snapshot_drivers(obj):
             "data_path": curve.data_path,
             "index": curve.array_index,
             "snapshot": live_controls.snapshot_driver(curve.driver),
+            "fcurve": fcurve_snapshot.capture(curve),
         })
     return records
 
@@ -260,8 +284,17 @@ def _restore_drivers(obj, records, errors=None):
         data_path = item["data_path"]
         index = int(item["index"])
         try:
-            _remove_driver(obj, data_path, index)
-            curve = _add_driver(obj, data_path, index)
+            curve = _find_driver(obj, data_path, index)
+            if curve is not None:
+                differences = _driver_snapshot_errors(
+                    item["snapshot"], live_controls.snapshot_driver(curve.driver), data_path,
+                )
+                if "fcurve" in item:
+                    differences.extend(fcurve_snapshot.errors(curve, item["fcurve"], data_path))
+                if not differences:
+                    continue
+            else:
+                curve = _add_driver(obj, data_path, index)
             if isinstance(curve, list):
                 curve = curve[0] if curve else None
             if curve is None:
@@ -271,6 +304,8 @@ def _restore_drivers(obj, records, errors=None):
                 )
                 continue
             live_controls.restore_driver(curve.driver, item["snapshot"])
+            if "fcurve" in item:
+                fcurve_snapshot.restore(curve, item["fcurve"])
         except Exception as exc:
             errors.append(
                 "%s %s: %s" % (getattr(obj, "name", ""), data_path, exc)
@@ -589,12 +624,30 @@ class GeneratedClearSnapshot:
             return
         self._ids.append({
             "id_key": key,
+            "owner": _owner_identity(block),
             "id_type": block.__class__.__name__,
             "name": getattr(block, "name", ""),
             "collection": target_memory.datablock_collection_name(block),
             "drivers": _snapshot_drivers(block),
             "action_state": self._capture_action_state(block),
         })
+        if isinstance(block, bpy.types.NodeTree):
+            item = self._ids[-1]
+            parent, _path = target_memory._embedded_node_tree_parent(block)
+            if parent is not None:
+                # A standalone holding tree avoids Material.copy(), whose
+                # embedded copy double-counts nested group users in Blender 4.2.
+                copied = bpy.data.node_groups.new(self._token + '_tree_' + parent.name, block.bl_idname)
+                copied.use_fake_user = True
+                item['graph_copy'] = copied
+                node_graph_snapshot.restore(copied, block)
+                item['graph_state'] = node_graph_snapshot.fingerprint(block)
+                for node in block.nodes:
+                    child = getattr(node, 'node_tree', None)
+                    if child is not None:
+                        self.capture_node_group(child)
+            else:
+                self.capture_node_group(block)
         if key not in self._records:
             self._records[key] = copy.deepcopy(applied_motion.read(block))
 
@@ -609,15 +662,24 @@ class GeneratedClearSnapshot:
     def capture_node_group(self, group):
         if group is None or not _alive(group, "node_groups"):
             return
-        if any(item["original_name"] == group.name for item in self._node_groups):
+        identity = _owner_identity(group)
+        if any(item['owner'] == identity for item in self._node_groups):
             return
         copied = group.copy()
         copied.use_fake_user = True
         copied.name = self._token + "_ng_" + group.name
         self._node_groups.append({
             "original_name": group.name,
+            "owner": identity,
             "copy": copied,
+            "fake_user": group.use_fake_user,
+            "graph_state": node_graph_snapshot.fingerprint(group),
+            "drivers": _snapshot_drivers(group),
         })
+        for node in group.nodes:
+            child = getattr(node, 'node_tree', None)
+            if child is not None:
+                self.capture_node_group(child)
 
     def capture_collection(self, collection):
         """Retain an owned collection and its explicit scene/parent membership."""
@@ -656,20 +718,20 @@ class GeneratedClearSnapshot:
         parents reference holding children exclusively.
         """
         entries = tuple(self._node_groups)
-        copies = {item["original_name"]: item["copy"] for item in entries}
-        copy_names = {
-            item["copy"].as_pointer(): item["original_name"] for item in entries
-        }
-        for item in entries:
-            copied = item["copy"]
-            if not _alive(copied, "node_groups"):
+        copies = {tuple(item['owner'].get(k, '') for k in ('id_type', 'id_name', 'library', 'owner_path')): item['copy'] for item in entries}
+        holding = {item['copy'].as_pointer() for item in entries}
+        graphs = [item['copy'] for item in entries]
+        graphs.extend(item['graph_copy'] for item in self._ids if 'graph_copy' in item)
+        for copied in graphs:
+            if not _id_alive(copied):
                 continue
             for node in tuple(getattr(copied, "nodes", ()) or ()):
                 child = getattr(node, "node_tree", None)
                 if child is None:
                     continue
-                original_name = copy_names.get(child.as_pointer(), child.name)
-                replacement = copies.get(original_name)
+                if child.as_pointer() in holding:
+                    continue
+                replacement = copies.get(_host_key(child))
                 if replacement is not None and child is not replacement:
                     node.node_tree = replacement
 
@@ -699,10 +761,29 @@ class GeneratedClearSnapshot:
             if not _alive(copied, "node_groups"):
                 ok = False
                 continue
-            if bpy.data.node_groups.get(item["original_name"]) is None:
+            if _resolve_owner(item['owner']) is None:
                 copied.name = item["original_name"]
-                copied.use_fake_user = False
+                copied.use_fake_user = item['fake_user']
                 item["promoted"] = True
+        # Holding parents must use the surviving/restored children before
+        # discard removes unpromoted child copies (which would null pointers).
+        restored_groups = {item['copy'].as_pointer(): _resolve_owner(item['owner'])
+                           for item in self._node_groups if _alive(item['copy'], 'node_groups')}
+        graphs = [item['copy'] for item in self._node_groups]
+        graphs.extend(item['graph_copy'] for item in self._ids if 'graph_copy' in item)
+        for graph in graphs:
+            for node in graph.nodes:
+                child = getattr(node, 'node_tree', None)
+                if child is not None and child.as_pointer() in restored_groups:
+                    node.node_tree = restored_groups[child.as_pointer()]
+        for item in self._node_groups:
+            live = _resolve_owner(item['owner'])
+            if live is not None:
+                node_graph_snapshot.restore(live, item['copy'])
+        for item in self._ids:
+            live = _resolve_owner(item['owner'])
+            if live is not None and 'graph_copy' in item:
+                node_graph_snapshot.restore(live, item['graph_copy'])
         for item in self._collections:
             holding = item["copy"]
             if not _alive(holding, "collections"):
@@ -790,7 +871,7 @@ class GeneratedClearSnapshot:
                 ok = False
                 continue
         for item in self._ids:
-            live = target_memory.find_id_block(item["id_type"], item["name"])
+            live = _resolve_owner(item['owner'])
             if live is None:
                 ok = False
                 continue
@@ -800,6 +881,10 @@ class GeneratedClearSnapshot:
             if records:
                 applied_motion.write(live, records)
         self._restore_source_visibility()
+        for item in self._node_groups:
+            live = _resolve_owner(item['owner'])
+            if live is not None:
+                _restore_drivers(live, item['drivers'], driver_errors)
         if driver_errors:
             ok = False
         return ok
@@ -961,6 +1046,10 @@ class GeneratedClearSnapshot:
         if self._discarded:
             return
         self._discarded = True
+        for item in self._ids:
+            graph = item.get('graph_copy')
+            if _alive(graph, 'node_groups'):
+                bpy.data.node_groups.remove(graph)
         for item in self._objects:
             clone = item["copy"]
             if not _object_alive(clone) or not clone.name.startswith(self._token):
@@ -1143,7 +1232,7 @@ class GeneratedClearSnapshot:
                     if code and code not in live_codes:
                         errors.append("missing record %s on %s" % (code, item["name"]))
         for item in self._ids:
-            live = target_memory.find_id_block(item["id_type"], item["name"])
+            live = _resolve_owner(item['owner'])
             if live is None:
                 errors.append("missing %s %s" % (item["id_type"], item["name"]))
                 continue
@@ -1156,6 +1245,8 @@ class GeneratedClearSnapshot:
             if bool(expected_action.get("action_key")) != bool(actual_action):
                 errors.append("%s %s Action mismatch" % (item["id_type"], item["name"]))
             expected = self._records.get(item["id_key"])
+            if 'graph_state' in item and node_graph_snapshot.fingerprint(live) != item['graph_state']:
+                errors.append('node graph mismatch on %s' % item['owner'])
             if expected:
                 live_codes = {record.get("code") for record in applied_motion.read(live)}
                 for record in expected:
@@ -1166,8 +1257,13 @@ class GeneratedClearSnapshot:
                             % (code, item["id_type"], item["name"])
                         )
         for item in self._node_groups:
-            if bpy.data.node_groups.get(item["original_name"]) is None:
+            live = _resolve_owner(item['owner'])
+            if live is None:
                 errors.append("missing node group %s" % item["original_name"])
+            else:
+                if node_graph_snapshot.fingerprint(live) != item['graph_state']:
+                    errors.append('node group graph mismatch on %s' % item['original_name'])
+                _verify_drivers(live, item['drivers'], item['original_name'], errors)
         for item in self._collections:
             collection = bpy.data.collections.get(item["original_name"])
             if collection is None:
