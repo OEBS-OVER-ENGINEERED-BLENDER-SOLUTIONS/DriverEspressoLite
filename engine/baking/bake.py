@@ -147,19 +147,16 @@ def bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, prog
 
 def _bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, progress=None,
                  smart=False, smart_tolerance=0.01, smart_passes=2):
-    """Bake a list of (owner, data_path, index) targets to keyframes.
+    """Bake a list of (owner, data_path, index) targets to keyframes. Returns
+    ``(baked_count, keyframe_count, message)``.
 
-    Returns ``(baked_count, keyframe_count, message)``. Every value is sampled
-    BEFORE any driver is removed, so removing one target's driver cannot change
-    another target's samples midway.
-
-    ``progress`` is an optional callable taking ``(done, total)`` frame counts,
-    so an operator can drive a Blender progress bar during a long bake.
-
-    Sampling is frame-OUTER: the frame is set once and every target read at that
-    frame, rather than stepping the whole timeline once per target. Setting the
-    frame re-evaluates the entire depsgraph, so a per-target loop would repeat
-    that work once for each of a colour plan's three channels.
+    Every value is sampled before any driver is removed, so removing one target's driver
+    cannot change another target's samples midway. ``progress`` is an optional callable
+    taking ``(done, total)`` frame counts, so an operator can drive a Blender progress
+    bar during a long bake. Sampling is frame-outer: the frame is set once and every
+    target read at that frame, rather than stepping the whole timeline once per target,
+    because setting the frame re-evaluates the entire depsgraph and a per-target loop
+    would repeat that work for each of a colour plan's three channels.
     """
     targets = list(targets)
     reason = preflight_targets(targets)
@@ -205,20 +202,6 @@ def _bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, pro
     finally:
         scene.frame_set(original)
 
-    # Capture private dependencies while the public drivers still exist. The
-    # driver variables are the authoritative ownership map; merely checking
-    # whether an object has any driver confuses unrelated animation with a
-    # surviving Espresso effect.
-    helper_resources = []
-    if remove_driver:
-        from ...apply import internal_helpers
-        for _owner, id_block, _data_path, resolved_path, index, _samples in plans:
-            fcurve = _find_driver(id_block, resolved_path, index)
-            if fcurve is not None:
-                helper_resources.extend(
-                    internal_helpers.resources_from_driver(fcurve.driver)
-                )
-
     for id_block in dict.fromkeys(plan[1] for plan in plans):
         _isolate_shared_action(id_block)
 
@@ -252,12 +235,11 @@ def _bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, pro
                 raise RuntimeError(f"Could not write a replacement key for {resolved_path} at frame {frame}.")
             keyframes += 1
 
-        # Interpolation and handles are part of the RESULT, not decoration. The
-        # fit was measured against these exact types - a bounce apex is
-        # auto-clamped so it cannot overshoot, its impact is vector because the
-        # curve really does corner there, and a square hold is CONSTANT because
-        # that is exact. Writing the keys without them produces a curve that
-        # misses the tolerance it was fitted to.
+        # Interpolation and handles are part of the result, not decoration. The fit was
+        # made against these exact types (a bounce apex is auto-clamped so it cannot
+        # overshoot, its impact is vector because the curve really does corner there,
+        # and a square hold is constant because that is exact), so writing the keys
+        # without them gives a curve that misses the tolerance it was fitted to.
         if smart_plan is not None:
             from . import smart_bake
             fcurve = _find_action_fcurve(id_block, resolved_path, index)
@@ -287,8 +269,8 @@ def _bake_targets(scene, targets, *, start, end, step=1, remove_driver=True, pro
             message += (" Smart bake saved %d of %d keys (%.0f%% fewer)."
                         % (saved, dense_total, 100.0 * saved / dense_total))
         else:
-            # Silence here would read as "smart bake did nothing wrong"; the
-            # artist should know the motion genuinely needed every frame.
+            # Reported rather than silent, so the artist knows the motion genuinely
+            # needed every frame.
             message += " Smart bake kept every frame: this motion changes too fast to thin."
     if removed_helpers:
         message += (" Cleared %d helper propert%s."
@@ -353,11 +335,9 @@ def _is_array_property(owner, data_path):
 def _driver_blocks_for_object(obj):
     """Every datablock reachable from one object that can carry a driver.
 
-    Walking only ``obj.animation_data`` is the single biggest gap in a naive
-    bake: measured on a scene with drivers on an object, a shape key, a
-    material node socket, a light's energy and a pose bone, the object-only
-    walk finds two of the five. The three it misses are precisely the ones a
-    template add-on creates.
+    Walking only ``obj.animation_data`` misses most of what a template add-on creates:
+    drivers on a shape key, a material node socket, a light's energy and a pose bone are
+    not on the object itself.
     """
     yield obj, "object"
     data = getattr(obj, "data", None)
@@ -388,12 +368,11 @@ def _driver_blocks_for_object(obj):
 
 
 def discover_driver_targets(objects, *, scene=None, include_muted=True):
-    """Collect every driven channel on ``objects`` (and optionally the scene).
-
-    Returns ``(targets, unresolved)``. ``unresolved`` counts drivers whose data
-    path could not be resolved - a stale driver left behind by a deleted node
-    or bone. They are reported rather than silently dropped, because a bake
-    that quietly skips channels looks identical to one that worked.
+    """Collect every driven channel on ``objects`` (and optionally the scene). Returns
+    ``(targets, unresolved)``. ``unresolved`` counts drivers whose data path could
+    not be resolved, such as a stale driver left behind by a deleted node or bone.
+    They are reported rather than silently dropped, because a bake that quietly skips
+    channels looks identical to one that worked.
     """
     seen_blocks = set()
     seen_channels = set()
@@ -441,11 +420,9 @@ def discover_driver_targets(objects, *, scene=None, include_muted=True):
 def set_driver_mute(targets, mute):
     """Mute or unmute the drivers behind ``targets``; returns how many changed.
 
-    Muting is the non-destructive alternative to removal, and it is not
-    optional decoration: a LIVE driver overrides the keyframes on its own
-    channel (measured), so a bake that leaves drivers running is invisible.
-    Either the driver goes or it is silenced - keeping it live is the one
-    outcome that cannot work.
+    Muting is the non-destructive alternative to removal. A live driver overrides the
+    keyframes on its own channel, so a bake that leaves drivers running has no visible
+    effect: the driver has to go or be silenced.
     """
     changed = 0
     for target in targets:

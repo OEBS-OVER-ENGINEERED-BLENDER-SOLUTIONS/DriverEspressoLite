@@ -1,36 +1,20 @@
-"""What motion is applied where - the record the bake and clear tools read.
+"""What motion is applied where: the record the bake and clear tools read.
 
-Most templates write custom properties, so their presence is already evidence.
-Many do not: a plain rotation driver leaves nothing behind but an F-curve whose
-expression could have been typed by hand. Without a record there is no way to
-answer "which of these drivers is Ball Bounce: Bowling Ball", and a bake list
-that cannot name what it is about to bake is not usable.
-
-So each application stamps the datablock that hosts its drivers:
+Many templates leave nothing behind but an F-curve whose expression could have been
+typed by hand, so each application stamps the datablock that hosts its drivers:
 
     obj["__espresso_applied"] = '[{"code": "BB01", "paths": [["location", 2]], ...}]'
 
-The host, not the object, because a driver lives on whichever ID owns the
-animation data - the object for a transform, the material's node tree for a
-shader value, the Scene for camera flash exposure. One code path covers all
-three, which is why scene-level motion needs no special case here.
+The host is the datablock that owns the animation data: the object for a transform, the
+material's node tree for a shader value, the Scene for scene-level motion. The stamp is
+plain ID property data, so it travels with duplicated or appended data and survives
+uninstalling the add-on.
 
-Two properties make this survive contact with real files:
-
-* It travels with the data. Duplicating an object copies its drivers and its
-  stamp together; appending into another file brings both.
-* It survives uninstalling the add-on, because it is plain ID property data.
-
-And one thing it cannot promise: a stamp can outlive the driver it describes,
-because nothing stops an artist deleting a driver by hand. So the driver is the
-authority on whether motion EXISTS and the stamp is the authority on WHAT it
-is - ``entries`` validates every record against a live F-curve and drops the
-ones that no longer resolve. That keeps every validating read honest with no
-repair step. The reads that must NOT validate (Clear needs to see leftovers)
-are made honest the other way: ``applied_reconcile`` notices the ID a driver
-was deleted from and, on idle, trims the dead channel or purges the record
-with its helpers. A leftover is therefore a state that lasts until Blender is
-next idle, not one that lives in the file.
+The driver is the authority on whether motion exists and the stamp on what it is.
+``entries`` validates every record against a live F-curve and drops those that no longer
+resolve. Reads that must not validate (Clear needs to see leftovers) rely on
+``applied_reconcile``, which notices the ID a driver was deleted from and, on idle,
+trims the dead channel or purges the record and its helpers.
 """
 
 from __future__ import annotations
@@ -46,8 +30,6 @@ PROPERTY = "__espresso_applied"
 
 # Custom properties whose names begin with this belong to an application and
 # must be removed along with it.
-HELPER_PREFIX = "__espresso_"
-LAST_EFFECT_ATTR = "last_applied_effect_token"
 
 
 def _remember_latest_effect(host, record):
@@ -168,7 +150,7 @@ def entries(host, validate=True):
 def remember(host, code, label, targets, extras=None):
     """Stamp one application. Re-applying the same code replaces its record.
 
-    Replacement rather than appending, because applying Ball Bounce twice to
+    Replacement rather than appending, because applying Constant Speed twice to
     one object is one motion with new settings, not two motions - and a list
     that grew every time would make the bake menu fill with duplicates.
     """
@@ -185,23 +167,17 @@ def remember(host, code, label, targets, extras=None):
     if extras:
         record["extras"] = extras
 
-    # An earlier effect that drove these same channels no longer does - this
-    # one took them. Its record has to give them up, and if that leaves it with
-    # nothing it is gone entirely.
-    #
-    # Without this the old record stayed "valid", because validation only asks
-    # whether a driver exists at that path and one does - the new one. Switching
-    # between Ball Bounce channels left the bake list offering Bowling, Golf and
-    # Tennis on an object that was only bouncing one way.
+    # An earlier effect that drove these same channels gives them up to this one. Its
+    # record loses those paths and is removed if none are left; otherwise it would keep
+    # being listed, because validation only checks that a driver exists at the path.
     claimed = {(str(p[0]), int(p[1])) for p in paths}
     records = []
     for item in read(host):
-        # Same code AND the same channels is the same application with new
-        # settings -- replaced, which is what "applying Ball Bounce twice to
-        # one object is one motion" has always meant. Same code on DIFFERENT
-        # channels is a second application, and it now survives instead of
-        # being deleted with its driver left running. It still gives up any
-        # channel this apply just took, by the same rule as every other code.
+        # The same code on the same channels is the same application with new settings,
+        # so it is replaced (applying Constant Speed twice to one object is one motion).
+        # The same code on different channels is a second application and is kept. It
+        # still gives up any channel this apply just took, by the same rule as every
+        # other code.
         if item.get("code") == str(code) and record_slot(item) == slot:
             continue
         if not claimed:
@@ -222,21 +198,17 @@ def remember(host, code, label, targets, extras=None):
 def prune(host):
     """Drop stamps whose drivers are all gone. Returns how many were removed.
 
-    ``entries`` already hides these, so this is hygiene rather than
-    correctness: without it, clearing every driver from an object leaves
-    ``__espresso_applied`` sitting in the custom-properties panel describing
-    motion that no longer exists.
-
-    Records with no recorded paths are kept - those describe setups built from
-    objects, constraints and node groups rather than drivers on this host, so
-    there is no F-curve whose absence means anything.
+    ``entries`` already hides these, so this is housekeeping: without it, clearing every
+    driver from an object leaves ``__espresso_applied`` in the custom-properties panel
+    describing motion that no longer exists. Records with no recorded paths are kept,
+    since there is no F-curve whose absence means anything.
     """
     records = read(host)
     if not records:
         return 0
     keep = []
     for record in records:
-        if resolve_template(record) is None:
+        if not is_ours(record):
             keep.append(record)
             continue
         paths = _paths_of(record)
@@ -249,12 +221,10 @@ def prune(host):
 
 
 def forget(host, code, slot=None):
-    """Drop one stamp. Returns the record removed, or None.
-
-    ``slot`` names ONE application when a recipe has been applied more than
-    once to the same host on different channels. Left out, every application
-    of that code goes -- which is what every existing caller means by "remove
-    this effect from this host", and what a setup teardown has to do.
+    """Drop one stamp. Returns the record removed, or None. ``slot`` names one
+    application when a recipe has been applied more than once to the same host on
+    different channels. Left out, every application of that code is removed, which is
+    what "remove this effect from this host" and a setup teardown mean.
     """
     records = read(host)
 
@@ -278,16 +248,10 @@ def forget(host, code, slot=None):
 def nested_node_trees(tree, _seen=None):
     """``tree`` and every node group reachable inside it.
 
-    An effect can be applied to a group NESTED inside a material rather than to
-    the material's own tree, which is exactly where a shipped Fire recipe puts
-    its controls. A walk that stops at ``material.node_tree`` never sees it.
-    Without it, a node group can carry a perfectly good ``__espresso_applied``
-    record while both the ACTIVE and the SCENE scope return nothing and Live
-    reports that the effect no longer resolves, with the motion still running
-    in the viewport.
-
-    Depth-guarded by identity rather than by a depth count, so a group that
-    somehow reaches itself is visited once instead of recursing for ever.
+    An effect can be applied to a group nested inside a material rather than to the
+    material's own tree, so a walk that stops at ``material.node_tree`` would miss its
+    record. Visited groups are tracked by identity rather than by depth, so a group that
+    reaches itself is visited once.
     """
     if tree is None:
         return []
@@ -339,12 +303,6 @@ def hosts_for_object(obj):
         for scene in getattr(obj, "users_scene", ()) or ():
             add(scene)
         add(getattr(bpy.context, "scene", None))
-        # A camera's owned support empty carries motion applied THROUGH the
-        # camera: an orbit drives the pivot the camera hangs from, and an
-        # artist who selects the camera means that motion too.
-        from .camera import support_rig as camera_support_rig
-
-        add(camera_support_rig.resolve_support_rig(obj))
     shape_keys = getattr(data, "shape_keys", None)
     add(shape_keys)
     for slot in getattr(obj, "material_slots", ()) or ():
@@ -375,8 +333,7 @@ def objects_using_node_tree(tree):
         found.append(obj)
 
     for material in getattr(bpy.data, "materials", []) or []:
-        # `is not tree` missed a group nested inside the material, which is
-        # the same blind spot hosts_for_object had.
+        # A plain ``is not tree`` check would miss a group nested inside the material.
         if tree not in nested_node_trees(getattr(material, "node_tree", None)):
             continue
         for obj in bpy.data.objects:
@@ -432,21 +389,11 @@ def host_token(host):
 def slot_for(paths):
     """A short, stable id for the exact channels one application drives.
 
-    Two applications of the SAME recipe to DIFFERENT channels of the same host
-    are two effects, not one. Nothing in the record said so: a record was
-    identified by host plus effect code alone, so the second apply had no way
-    to be told apart from the first -- and `remember` resolved that by deleting
-    the older one while its driver went on running. Found in the wild: one
-    node group with two live Campfire Flicker drivers on it, on `inputs[3]`
-    and `inputs[0]`, and a single record naming only `inputs[0]`. The first
-    effect still drove the shot and could not be seen, edited, baked or
-    removed.
-
-    Derived from the channels rather than stored as a counter, so it is the
-    same id every time the same channels are claimed -- which is what keeps
-    re-applying to the same socket a REPLACEMENT, exactly as before. Empty for
-    a record with no paths (a setup made of objects and node groups), so those
-    keep the token they have always had.
+    Two applications of the same recipe to different channels of one host are two
+    effects, so a record cannot be identified by host and effect code alone. The id is
+    derived from the channels rather than stored as a counter, so it is the same every
+    time the same channels are claimed, which keeps re-applying to the same socket a
+    replacement. Empty for a record with no paths.
     """
     claimed = sorted(
         "%s\x1e%d" % (str(entry[0]), int(entry[1]) if len(entry) > 1 else -1)
@@ -574,40 +521,13 @@ def _channel_name(host, data_path):
 
 
 _BONE_PATH = re.compile(r'pose\.bones\["([^"]+)"\]')
-_AXIS_NAMES = ("X", "Y", "Z", "W")
-
-
-def channel_name(host, data_path, index=-1):
-    """One driven channel's name for a menu row -- never blank.
-
-    ``_channel_name`` for a socket or custom property, otherwise the last
-    path segment as words plus the axis letter: "Emission Strength",
-    "Location Z", "Arm · Rotation Euler X". The raw path is the last resort.
-    """
-    text = str(data_path or "")
-    name = _channel_name(host, data_path)
-    if name:
-        if _BONE_PATH.search(text) and int(index or -1) >= 0:
-            axis = _AXIS_NAMES[index] if index < len(_AXIS_NAMES) else str(index)
-            return "%s %s" % (name, axis)
-        return name
-    tail = text.rsplit(".", 1)[-1]
-    words = tail.replace("_", " ").title() if tail and "[" not in tail else (tail or text)
-    try:
-        index = int(index)
-    except (TypeError, ValueError):
-        index = -1
-    if index >= 0:
-        axis = _AXIS_NAMES[index] if index < len(_AXIS_NAMES) else str(index)
-        return "%s %s" % (words, axis)
-    return words
 
 
 def channel_label(host, record):
     """Where this record drives, in words. Empty when it has nothing to add.
 
     Two applications of one recipe on one host are told apart by WHERE they
-    drive, so anything listing them has to say where. "Campfire Flicker"
+    drive, so anything listing them has to say where. "Candle Flicker"
     twice is not a choice an artist can make; "Campfire Flicker \u00b7 Top
     Brightness" and "\u00b7 Master Height" is.
     """
@@ -646,26 +566,20 @@ def describe(record):
     return label
 
 
+def is_ours(record):
+    """A record this build wrote: a known recipe, or a Motion Stack.
+
+    Anything else came from elsewhere and is left exactly as found.
+    """
+    from . import stack_records
+
+    return (resolve_template(record) is not None
+            or stack_records.stack_from_extras(record.get("extras") or {}) is not None)
+
+
 def resolve_template(record):
     """The catalogue template a stamp refers to, or None if it is unknown."""
     from ...catalogue import templates
 
     return templates.template_for_effect_id(record.get("code"))
 
-
-def helper_property_names(host, record):
-    """Custom properties this application owns, for removal.
-
-    Matched by the code embedded in the name (``__espresso_BB01_a``) rather
-    than by the bare prefix, so clearing one effect cannot take another's
-    properties with it when two are applied to the same object.
-    """
-    code = str(record.get("code") or "")
-    if not code or host is None:
-        return []
-    prefix = "%s%s_" % (HELPER_PREFIX, code)
-    try:
-        keys = list(host.keys())
-    except (AttributeError, TypeError):
-        return []
-    return [key for key in keys if key.startswith(prefix)]

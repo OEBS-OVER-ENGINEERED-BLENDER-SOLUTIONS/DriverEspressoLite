@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Driver Espresso Lite",
     "author": "OEBS Studios",
-    "version": (1, 6, 5),
+    "version": (1, 6, 6),
     "blender": (4, 2, 0),
     "location": "View3D / Graph Editor > Sidebar > Espresso",
     "description": "Template-driven builder for native Blender motion systems.",
@@ -12,19 +12,7 @@ import bpy
 from textwrap import wrap
 
 from .engine import utils as _utils
-from .product import identity
 from .apply import target_memory
-
-
-CHANNEL_DISPLAY_DEFAULT = "SWAP_BUTTONS_DROPDOWN"
-CHANNEL_DISPLAY_ITEMS = [
-    # How the channel picker renders, by member count. Ordered compact→expanded.
-    ("DROPDOWN", "Always Dropdown", "Every channel set uses a dropdown, whatever its size"),
-    ("SWAP_DROPDOWN", "Swap, then Dropdown", "Two channels: one swap button. Three or more: a dropdown"),
-    ("SWAP_BUTTONS_DROPDOWN", "Swap · Buttons · Dropdown", "Two: swap. Three: a button row. Four or more: three pinned buttons plus a dropdown for the rest"),
-    ("BUTTONS_DROPDOWN", "Buttons, then Dropdown", "Up to three channels as buttons; four or more as a dropdown"),
-    ("BUTTONS", "Always Buttons", "Every channel shown as its own button, whatever the count"),
-]
 
 
 QUICK_PRESET_MODE_DEFAULT = "FEATURED"
@@ -77,26 +65,6 @@ class ESPRESSO_AddonPreferences(bpy.types.AddonPreferences):
         description="When switching templates, shared parameters such as Minimum, Maximum, Period, or Speed follow the most recently edited manual value",
         default=True,
     )
-    carry_manual_params_channels_only: bpy.props.BoolProperty(
-        name="Only Between Channels",
-        description=(
-            "Limit carried manual values to templates grouped as channels of "
-            "the same setup. Turn this off to carry matching values between "
-            "unrelated templates too"
-        ),
-        default=True,
-    )
-    carry_manual_params_paired_only: bpy.props.BoolProperty(
-        name="Only Paired Channels",
-        description=(
-            "Limit carried manual values to explicitly paired channels — the "
-            "Green/Amber/Red aspects of a signal, an ambulance bar's four "
-            "colours, or the X and Y halves of an orbit. Alternative profiles "
-            "such as Bowling, Golf, Tennis, Rubber, and Ping-Pong keep their "
-            "own material defaults"
-        ),
-        default=True,
-    )
     conflict_policy: bpy.props.EnumProperty(
         name="Conflict Handling",
         description="How Driver Espresso handles an existing effect on the channels being applied",
@@ -142,12 +110,6 @@ class ESPRESSO_AddonPreferences(bpy.types.AddonPreferences):
         min=2,
         max=10,
     )
-    channel_display: bpy.props.EnumProperty(
-        name="Channel Display",
-        description="How the channel picker renders sibling templates (a signal head's Green/Amber/Red, a police bar's two heads), by member count",
-        items=_utils.mark_recommended(CHANNEL_DISPLAY_ITEMS, CHANNEL_DISPLAY_DEFAULT),
-        default=CHANNEL_DISPLAY_DEFAULT,
-    )
     quick_preset_mode: bpy.props.EnumProperty(
         name="Mode",
         description="How the Master Preset shelf chooses which buttons to show",
@@ -164,15 +126,8 @@ class ESPRESSO_AddonPreferences(bpy.types.AddonPreferences):
         ),
         default=False,
     )
-    # --- Panel visibility -----------------------------------------------
-    # Which sections are drawn. Deliberately NOT offered for Parameters or the
-    # expression block: hiding those would leave a panel that cannot do its job,
-    # and a user who hid them would reasonably think the add-on was broken.
-    show_input_controller_panel: bpy.props.BoolProperty(
-        name="Controller Workspace",
-        description="Legacy saved preference; the Controller workspace is now part of the main Espresso panel",
-        default=True,
-    )
+    # Panel visibility: which sections are drawn. Parameters and the expression block
+    # cannot be hidden, because the panel could not do its job without them.
     show_preview_panel: bpy.props.BoolProperty(
         name="Preview Panel",
         description="Show the standalone Preview panel with the waveform graph",
@@ -182,11 +137,6 @@ class ESPRESSO_AddonPreferences(bpy.types.AddonPreferences):
         name="Diagnostics",
         description="Show internal controller names and binding details in the Input Controller panel",
         default=False,
-    )
-    show_favorites_section: bpy.props.BoolProperty(
-        name="Favorites & Recent",
-        description="Show the starred and recently used templates above the template list",
-        default=True,
     )
     show_variants_section: bpy.props.BoolProperty(
         name="Variants",
@@ -201,11 +151,6 @@ class ESPRESSO_AddonPreferences(bpy.types.AddonPreferences):
     show_advanced_section: bpy.props.BoolProperty(
         name="Advanced Controls",
         description="Show the ADVANCED box for templates that expose timing and output controls",
-        default=True,
-    )
-    show_driver_target_section: bpy.props.BoolProperty(
-        name="Organize Workspace",
-        description="Legacy saved preference; the Organize workspace is now part of the main Espresso panel",
         default=True,
     )
 
@@ -244,15 +189,6 @@ class ESPRESSO_AddonPreferences(bpy.types.AddonPreferences):
         behavior_box.label(text="Template Switching", icon="FILE_REFRESH")
         behavior_box.prop(self, "remember_template_params")
         behavior_box.prop(self, "carry_manual_params")
-        channels_row = behavior_box.row()
-        channels_row.enabled = self.carry_manual_params
-        channels_row.prop(self, "carry_manual_params_channels_only")
-        paired_row = behavior_box.row()
-        paired_row.enabled = (
-            self.carry_manual_params
-            and self.carry_manual_params_channels_only
-        )
-        paired_row.prop(self, "carry_manual_params_paired_only")
 
         conflict_box = layout.box()
         conflict_box.label(text="Apply Conflicts", icon="ERROR")
@@ -287,17 +223,9 @@ class ESPRESSO_AddonPreferences(bpy.types.AddonPreferences):
         main_col = panels_box.column(align=True)
         main_col.label(text="Main panel sections", icon="DOT")
         sub = main_col.column(align=True)
-        # Only offer the toggle where the section exists at all --
-        # a preference that turns on nothing is worse than no preference.
-        if getattr(identity, "HAS_FAVORITES", True):
-            sub.prop(self, "show_favorites_section")
         sub.prop(self, "show_subcategory_row")
         sub.prop(self, "show_variants_section")
         sub.prop(self, "show_advanced_section")
-
-        channels_box = layout.box()
-        channels_box.label(text="Channels", icon="LINKED")
-        channels_box.prop(self, "channel_display")
 
     def _draw_targets(self, layout):
         picker_box = layout.box()
@@ -413,5 +341,5 @@ def unregister():
     # Compile/regex caches hold only immutable code objects and patterns,
     # but clear them so repeated reloads during development cannot pile up.
     from .engine import utils as _utils
-    _utils._cached_compile.cache_clear()
+    _utils._parsed.cache_clear()
     _utils._token_pattern.cache_clear()

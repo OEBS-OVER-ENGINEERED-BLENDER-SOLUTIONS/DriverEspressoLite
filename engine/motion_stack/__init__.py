@@ -5,5 +5,4 @@ multi-channel recipes run on -- a stack of layers, a blend mode per layer, and
 a compiler that turns them into one expression per channel.
 """
 
-from .contracts import *  # noqa: F401,F403
 from .stack import *  # noqa: F401,F403

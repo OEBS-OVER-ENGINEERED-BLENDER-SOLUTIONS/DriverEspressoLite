@@ -11,7 +11,6 @@ import bpy
 from ...apply import apply_behavior, driver_targets, source_binding, target_memory
 from ...catalogue import catalogue_contracts, templates
 from ...engine import live_control_core, utils
-from ...engine.expression.driver_literals import format_driver_literal
 
 
 CONTROLLER_VARIABLE = "espctl_"
@@ -28,7 +27,6 @@ RESET_BASELINE = "BASELINE"
 RESET_CUSTOM = "CUSTOM"
 
 SCOPE_ACTIVE = "ACTIVE"
-SCOPE_RELATED = "RELATED"
 SCOPE_MOTION = "MOTION"
 SCOPE_SCENE = "SCENE"
 
@@ -41,10 +39,10 @@ def _read_json(raw, fallback):
     return value if isinstance(value, type(fallback)) else fallback
 
 
-# Every field a controller record is expected to carry. The panel and the
-# attach path read these directly, so a record written by an older build - or
-# left half-formed by an interrupted edit - would otherwise raise KeyError
-# inside draw(), which Blender surfaces as the panel simply vanishing.
+# Every field a controller record is expected to carry. The panel and the attach path
+# read these directly, so a record written by an older build, or left half-formed by an
+# interrupted edit, would otherwise raise KeyError inside draw(), which Blender surfaces
+# as the panel vanishing.
 _CONTROLLER_DEFAULTS = {
     "name": "Unnamed Controller",
     "source": {},
@@ -68,14 +66,11 @@ def _normalized_controller(record):
     return filled
 
 
-# A controller is STORED ON the ID that carries its driving property - the object
-# whose custom property drives it - not in one scene-wide blob. Co-locating them
-# removes a whole failure mode: delete the object and its controller goes with
-# it, instead of leaving a record pointing at a source that no longer exists.
-# Append or link that object into another file and the controller travels too.
-#
-# Controllers driven by a SCENE property have no object to live on, so the scene
-# remains a valid home for those.
+# A controller is stored on the ID that carries its driving property (the object whose
+# custom property drives it), not in one scene-wide blob. Deleting the object deletes
+# its controller, and appending or linking the object into another file brings the
+# controller with it. Controllers driven by a scene property have no object to live on,
+# so the scene remains a valid home for those.
 CONTROLLER_KEY = "espresso_controllers"
 
 
@@ -127,10 +122,9 @@ def controller_home(record, scene=None):
 
 
 def read_controllers(props):
-    """Gather controllers from every store, newest definition winning per uid.
-
-    The legacy scene-wide list is read last so an older file keeps working; the
-    next write relocates those records onto their objects and empties it.
+    """Gather controllers from every store, newest definition winning per uid. The
+    scene-wide list is read last so an older file keeps working; the next write moves
+    those records onto their objects and empties it.
     """
     seen = {}
     order = []
@@ -169,11 +163,10 @@ def write_controllers(props, controllers):
         if owner not in grouped:
             _write_store(owner, [])
 
-    # Any records still sitting in the legacy scene-wide list have now been
-    # written to their real homes, so empty it. This is what migrates an older
-    # file - implicitly, on the first write - and it is also required for
-    # correctness: left populated, read_controllers would keep resurrecting a
-    # controller the user had just deleted.
+    # Any records still in the scene-wide list have now been written to their homes, so
+    # empty it. This migrates an older file on its first write, and is required for
+    # correctness: left populated, read_controllers would resurrect a controller the
+    # user had just deleted.
     if getattr(props, "live_controllers", "[]") not in ("[]", ""):
         props.live_controllers = "[]"
 
@@ -211,9 +204,9 @@ NO_CONTROLLER = "__NONE__"
 
 
 def controller_items(props, _context):
-    # Without a blank first entry Blender falls back to index 0, so every object
-    # looks like it already has the first controller attached - selected-looking,
-    # but not editable, because nothing is actually bound to it.
+    # Without a blank first entry Blender falls back to index 0, so every object would
+    # look as if the first controller were already attached: shown as selected but not
+    # editable, because nothing is bound to it.
     controllers = read_controllers(props)
     if not controllers:
         return [
@@ -532,16 +525,6 @@ def _carrier_fcurve(scene, path):
     return result[0] if isinstance(result, list) else result
 
 
-def _unsupported_template_reason(template):
-    if catalogue_contracts.resolve_additive_profile(template) == catalogue_contracts.ELAPSED_TIME:
-        return (
-            "This accumulated-time template needs phase-safe capture before it can "
-            "be stopped and resumed honestly. That controller mode is reserved for "
-            "the captured-controls update."
-        )
-    return ""
-
-
 def draft_base_snapshot(owner, base_snapshot, configure):
     """Build a replacement driver on the same ID without touching its public channel."""
     key = f"__espresso_draft_{uuid.uuid4().hex}"
@@ -563,7 +546,6 @@ def draft_base_snapshot(owner, base_snapshot, configure):
 
 def replace_base_snapshots(scene, props, replacements, template=None):
     """Commit validated base recipes while preserving attached controller layers."""
-    from ...apply import driver_manager
 
     bindings_before = getattr(props, "live_control_bindings", "{}")
     bindings = read_bindings(props)
@@ -578,10 +560,6 @@ def replace_base_snapshots(scene, props, replacements, template=None):
                 "Controller-aware Update needs one exact driver component; "
                 "reapply a specific component before updating."
             )
-        if getattr(driver_manager, "foreign_live_motion_for_channel", lambda *_: None)(
-            owner, path, index,
-        ):
-            return False, f"An unavailable edition owns {path}[{index}]."
         descriptor = target_memory.serialize_target(owner, path, index)
         key = _target_key(descriptor)
         binding = bindings.get(key)
@@ -748,9 +726,6 @@ def attach_fcurves(
     baseline_value,
     template,
 ):
-    reason = _unsupported_template_reason(template)
-    if reason:
-        return False, reason, 0
     source, source_reason = source_binding.resolve_source(controller.get("source"))
     if source is None:
         return False, source_reason or "The controller source is unavailable.", 0
@@ -880,9 +855,9 @@ def attach_fcurves(
                 "disabled": False,
             }
     except Exception as exc:
-        # A restore can itself fail if the driver was partially rewritten before
-        # the outer error fired. Never claim a clean rollback in that case - the
-        # user must know which drivers to inspect.
+        # A restore can itself fail if the driver was partially rewritten before the
+        # outer error fired. A clean rollback is never claimed in that case, so the user
+        # knows which drivers to inspect.
         unrestored = 0
         for fcurve, snapshot in current_snapshots:
             try:
@@ -950,10 +925,6 @@ def set_fcurves_enabled(scene, props, fcurves, enabled, template):
     snapshot. The binding stays owned throughout, so this is reversible and
     independent of timeline playback direction.
     """
-    if not live_control_core.supports_safe_disable(
-        catalogue_contracts.resolve_additive_profile(template)
-    ):
-        return False, _unsupported_template_reason(template), 0
     bindings_before = getattr(props, "live_control_bindings", "{}")
     bindings = read_bindings(props)
     snapshots = [(fcurve, snapshot_driver(fcurve.driver)) for fcurve in fcurves]
@@ -1069,9 +1040,9 @@ def scene_motion_label(effect):
 def scene_motion_choices(context):
     """(record token, label) for every motion a controller could attach to.
 
-    Only driver-backed effects: a setup made of objects and node groups has no
-    F-curve for a controller layer to wrap, so offering it would only lead to
-    the resolver's "has no drivers" reason a click later.
+    Only driver-backed effects: a record with no drivers has no F-curve for a
+    controller layer to wrap, so offering it would only lead to the resolver's
+    "has no drivers" reason a click later.
     """
     from ...apply.motion import applied_motion, applied_motion_manager
 
@@ -1080,12 +1051,11 @@ def scene_motion_choices(context):
         record = effect.get("record")
         if not record or not applied_motion.paths_of(record):
             continue
-        # LIVE drivers only. The collector keeps a stamp whose driver was
-        # deleted by hand -- the driver is the authority on whether motion
-        # exists, the stamp on what it is, and Clear needs to see leftovers.
-        # A controller cannot attach to a leftover, so it is not offered.
-        # Found in the wild: an Empty with one Scene Length Loop on Rotation Z
-        # and a stale stamp for Rotation X, offered as two identical rows.
+        # Live drivers only. The collector keeps a stamp whose driver was deleted by
+        # hand (the driver is the authority on whether motion exists, the stamp on what
+        # it is, and Clear needs to see leftovers), but a controller cannot attach to a
+        # leftover, so it is not offered. Otherwise a stale stamp for Rotation X would
+        # be listed beside the live Rotation Z driver as a second identical row.
         live = _record_fcurves(effect.get("host"), record)
         if not live:
             continue
@@ -1144,8 +1114,6 @@ def _record_fcurves(host, record):
 def _scene_motion_fcurves(context, props):
     """The drivers the chosen scene motion actually owns, with the reason
     when there is nothing to hand back."""
-    from ...apply.motion import applied_motion
-
     if not str(getattr(props, "live_control_scene_token", "") or ""):
         return [], "Choose a motion from the scene to attach to."
     effect = scene_motion_effect(context, props)
@@ -1161,13 +1129,11 @@ def _scene_motion_fcurves(context, props):
 
 
 def scope_template(context, template, scope):
-    """The recipe the scoped drivers were APPLIED with.
-
-    For every scope but Scene Motion that is the panel's current template,
-    because those scopes are defined relative to it. A scene motion can be
-    any recipe at all -- the panel may show Police Lights while the chosen
-    motion is Campfire Flicker -- and its rest baseline belongs to the recipe
-    that made it, not to whatever the panel happens to be showing.
+    """The recipe the scoped drivers were applied with. For every scope but Scene Motion
+    that is the panel's current template, because those scopes are defined relative
+    to it. A scene motion can be any recipe at all (the panel may show RGB Colour
+    Cycle while the chosen motion is Candle Flicker), and its rest baseline belongs
+    to the recipe that made it, not to whatever the panel is showing.
     """
     if scope != SCOPE_SCENE:
         return template
@@ -1196,43 +1162,7 @@ def resolve_scope_fcurves(context, template, scope):
             return [], "Select the same Motion Set template that was applied most recently."
         fcurves = _entry_fcurves(entry)
         return fcurves, "" if fcurves else "The remembered Motion Set no longer exists."
-    if active is None:
-        return [], reason
-    pair_id = template.get("pair_with")
-    if not pair_id:
-        return [], "This template has no declared Related Pair."
-    pair_entry = target_memory.recent_template_entry(props, pair_id)
-    if not pair_entry:
-        return [], (
-            f"Apply {templates.TEMPLATE_BY_ID.get(pair_id, {}).get('name', pair_id)} "
-            "once so Espresso can identify its paired target."
-        )
-    fcurves = ([active] if active is not None else []) + _entry_fcurves(pair_entry)
-    return fcurves, "" if fcurves else "The related pair targets no longer exist."
-
-
-def _binding_recipe_driver(scene, fcurve, binding):
-    carrier_path = (binding or {}).get("carrier_path", "")
-    animation_data = getattr(scene, "animation_data", None)
-    if carrier_path and animation_data is not None:
-        carrier = animation_data.drivers.find(carrier_path)
-        if carrier is not None:
-            return carrier.driver
-    return fcurve.driver
-
-
-def _missing_recipe_variables(driver, template):
-    """Delegate to the one shared implementation.
-
-    This calls ``operators.missing_required_variables`` rather than keeping a
-    near-copy of it with its own None-guard. Two copies of the same rule are
-    exactly how the earlier float-formatter divergence happened, so this now
-    forwards instead. Imported lazily because ``props`` reaches back into this
-    module.
-    """
-    from ..actions.operators import missing_required_variables
-
-    return missing_required_variables(driver, template)
+    return ([active] if active is not None else []), reason
 
 
 def _active_object_fcurves(context):
@@ -1254,12 +1184,10 @@ def _active_object_fcurves(context):
 
 
 def object_controller_uids(context, props):
-    """Controller uids actually attached to a driver on the active object.
-
-    Controllers live on the scene, so without this every object showed every
-    controller. Ownership is derived from the binding records rather than a
-    stored owner name, so it stays correct when objects are renamed or
-    duplicated - a stored name would silently point at the wrong object.
+    """Controller uids attached to a driver on the active object. Controllers live on
+    the scene, so without this every object would show every controller. Ownership is
+    derived from the binding records rather than a stored owner name, so it stays
+    correct when objects are renamed or duplicated.
     """
     bindings = read_bindings(props)
     uids = set()
@@ -1283,7 +1211,6 @@ def resolve_scope_control_status(context, template, scope, selected_uid=""):
         "controller_names": [],
         "strategies": [],
         "has_selected_controller": False,
-        "missing_recipe_variables": [],
         "current_expression": (
             fcurves[0].driver.expression if fcurves else ""
         ),
@@ -1300,7 +1227,6 @@ def resolve_scope_control_status(context, template, scope, selected_uid=""):
         for item in read_controllers(props)
     }
     attached = []
-    missing_recipe_variables = set()
     for fcurve in fcurves:
         descriptor = _target_descriptor(fcurve)
         binding = bindings.get(_target_key(descriptor)) if descriptor else None
@@ -1314,13 +1240,6 @@ def resolve_scope_control_status(context, template, scope, selected_uid=""):
             or CONTROLLER_VARIABLE not in driver.expression
         ):
             result["broken_count"] += 1
-        if binding.get("template_id") == (template or {}).get("id"):
-            recipe_driver = _binding_recipe_driver(
-                context.scene, fcurve, binding,
-            )
-            missing_recipe_variables.update(
-                _missing_recipe_variables(recipe_driver, template)
-            )
 
     result["attached_count"] = len(attached)
     if not attached:
@@ -1342,7 +1261,6 @@ def resolve_scope_control_status(context, template, scope, selected_uid=""):
     result["has_selected_controller"] = bool(
         selected_uid and selected_uid in controller_uids
     )
-    result["missing_recipe_variables"] = sorted(missing_recipe_variables)
 
     if len(attached) < len(fcurves):
         result["code"] = "PARTIAL"
@@ -1358,17 +1276,14 @@ def resolve_scope_control_status(context, template, scope, selected_uid=""):
 def relink_controller_bindings(scene, props, controller):
     """Re-apply a controller to every driver it is attached to.
 
-    Rebinding the source variable alone is NOT enough. Interpretation,
-    threshold, invert, clamp and response curve are baked into each driver's
-    expression *string* when it is attached, so editing them must recompile and
-    reinstall every attached expression — otherwise the edit updates only the
-    controller's stored metadata and the drivers keep running the old maths
-    while the UI reports success.
-
-    Re-attaching reuses ``attach_fcurves`` so carrier/inline transitions, the
-    length guard and reserved-name checks all stay in one place. Each driver
-    keeps its own recorded reset mode and rest value, so re-applying never
-    moves a driver's anchor.
+    Rebinding the source variable alone is not enough. Interpretation, threshold,
+    invert, clamp and response curve are baked into each driver's expression string when
+    it is attached, so editing them must recompile and reinstall every attached
+    expression; otherwise only the controller's stored metadata changes and the drivers
+    keep running the old maths. Re-attaching reuses ``attach_fcurves`` so carrier/inline
+    transitions, the length guard and reserved-name checks stay in one place. Each
+    driver keeps its own recorded reset mode and rest value, so re-applying never moves
+    a driver's anchor.
     """
     source, reason = source_binding.resolve_source(controller.get("source"))
     if source is None:
@@ -2089,17 +2004,6 @@ def draw_panel(layout, props, template, context):
                 )
             status_box.label(text=marker, icon="BLANK1")
 
-    if control_status["missing_recipe_variables"]:
-        recipe_row = status_box.row()
-        recipe_row.alert = True
-        recipe_row.label(
-            text=(
-                "Controller attached, but recipe input is missing: "
-                + ", ".join(control_status["missing_recipe_variables"])
-            ),
-            icon="ERROR",
-        )
-
     actions = layout.row(align=True)
     attach_action = actions.row(align=True)
     attach_action.enabled = (
@@ -2136,10 +2040,6 @@ def draw_panel(layout, props, template, context):
         text="Resume",
         icon="PLAY",
     )
-    if _unsupported_template_reason(template):
-        notice = layout.row()
-        notice.alert = True
-        notice.label(text="Reserved for captured controls", icon="ERROR")
 
 
 CLASSES = (

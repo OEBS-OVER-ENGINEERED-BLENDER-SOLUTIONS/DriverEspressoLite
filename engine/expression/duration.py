@@ -1,32 +1,22 @@
 # -*- coding: utf-8 -*-
-"""How long is this motion, actually?
+"""How long is this motion?
 
-An artist setting Landing frame 12 and Recovery time 24 wants to know the move
-is over by frame 36. Nothing in the panel said so: the parameters are visible
-but the total they add up to is not, and for anything with a recovery tail or a
-settle the total is exactly what you need to know to place the shot.
+An artist setting Landing frame 12 and Recovery time 24 needs to know the move is over
+by frame 36, and for anything with a recovery tail or a settle the total decides where
+the shot goes. The answer is measured from the built expression rather than declared per
+template, so it cannot go stale when a kernel changes:
 
-The answer is MEASURED, not declared. `frame_mode` says how a template relates
-to the scene range, not how long it runs, and a per-template "duration" field
-would be 270 hand-written numbers that drift the moment a kernel changes.
-Evaluating the built expression and watching what it does is the only account
-that cannot go stale:
+* settles to a constant and stays there: FINITE, report the settle frame
+* repeats: CYCLIC, report the loop length
+* keeps growing: INFINITE
+* none of those: CONTINUOUS (stochastic flicker, noise), where no number is honest
 
-  * settles to a constant and stays there  -> FINITE, report the settle frame
-  * repeats                                -> CYCLIC, report the loop length
-  * keeps growing                          -> INFINITE
-  * none of those                          -> CONTINUOUS (stochastic flicker,
-                                              noise - it never repeats and never
-                                              stops, so no number is honest)
-
-Results are cached: the panel redraws far more often than parameters change.
+Results are cached, since the panel redraws far more often than parameters change.
 """
 
 from __future__ import annotations
 
-import math
-
-from . import utils
+from . import formula_reader, utils
 
 FINITE = "FINITE"
 CYCLIC = "CYCLIC"
@@ -57,36 +47,24 @@ _PERIODS = tuple(range(2, 301))
 _cache = {}
 
 
-def clear_cache():
-    _cache.clear()
-
-
 def _sample(channels, frame_start, window=WINDOW, variables=None):
     """Evaluate every channel across the window; None if it cannot be read."""
     namespace = dict(utils.SAFE_NAMESPACE)
     namespace.update(variables or {})
-    empty = {"__builtins__": {}}
     series = []
     for channel in channels:
         expression = channel["expression"]
-        # Compiled once. Passing the string to eval() re-parses it on every one
-        # of 900 frames, which was most of the cost of this sweep.
+        # Read once: reading the text again on every one of 900 frames would be most of
+        # the cost of this sweep.
         try:
-            code = compile(expression, "<duration>", "eval")
-            helper_codes = [
-                (helper["name"], compile(
-                    helper["expression"], "<duration_helper>", "eval"))
-                for helper in channel.get("internal_helpers", [])
-            ]
+            code = formula_reader.parse(expression)
         except Exception:
             return None
         values = []
         for offset in range(window):
             namespace["frame"] = frame_start + offset
             try:
-                for name, helper_code in helper_codes:
-                    namespace[name] = eval(helper_code, empty, namespace)
-                values.append(float(eval(code, empty, namespace)))
+                values.append(float(code(namespace)))
             except Exception:
                 return None
         series.append(values)
@@ -97,12 +75,11 @@ def _span(values):
     return max(values) - min(values)
 
 
-# A settle is only a settle if the value then HOLDS. Without a minimum tail the
-# backward walk stops at the last change, which for a linear ramp is two frames
-# from the window end - so Constant Speed reported "896 frames" instead of
-# Infinite, and a colour cycle holding its last swatch reported 888 instead of
-# a 48-frame loop. The tail must be long enough that no plausible cycle fits in
-# it.
+# A settle is only a settle if the value then holds. Without a minimum tail the backward
+# walk stops at the last change, which for a linear ramp is two frames from the window
+# end, so it would report a finite length instead of Infinite, and a colour cycle
+# holding its last swatch would report a settle instead of a loop. The tail must be long
+# enough that no plausible cycle fits in it.
 MIN_SETTLED_TAIL = 300
 
 
@@ -162,10 +139,7 @@ def classify(template, values, scene):
     # Templates that read a driver variable cannot be evaluated without one.
     # Each declares a preview_default for exactly this purpose, so use it -
     # holding the input STILL and watching what time alone does.
-    required = [
-        *(template.get("requires_driver_variables") or []),
-        *(template.get("managed_driver_variables") or []),
-    ]
+    required = list(template.get("requires_driver_variables") or [])
     variables = {spec["name"]: float(spec.get("preview_default", 0.0) or 0.0)
                  for spec in required}
 

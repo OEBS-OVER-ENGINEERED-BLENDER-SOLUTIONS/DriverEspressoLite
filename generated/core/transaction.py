@@ -6,7 +6,7 @@ from typing import Callable, List
 
 
 class GeneratedTransaction:
-    """Collect rollback callbacks until a generated setup is committed."""
+    """Collect rollback callbacks until the whole change is committed."""
 
     def __init__(self, setup_id: str):
         self.setup_id = str(setup_id)
@@ -25,36 +25,13 @@ class GeneratedTransaction:
         self.committed = True
         self._rollback.clear()
 
-    def execute(self, *, resolve, validate, preflight, snapshot, create,
-                verify, commit_manifest, remember):
-        """Run the single generated-mutation sequence and commit atomically."""
-        resolved = resolve()
-        if validate(resolved) is False:
-            raise RuntimeError("Generated setup validation failed")
-        if preflight(resolved) is False:
-            raise RuntimeError("Generated setup preflight failed")
-        captured = snapshot()
-        if callable(captured):
-            self.on_rollback(captured)
-        try:
-            created = create(captured)
-            if verify(created) is False:
-                raise RuntimeError("Generated setup verification failed")
-            manifest = commit_manifest(created)
-            remember(manifest if manifest is not None else created)
-            self.commit()
-            return manifest if manifest is not None else created
-        except Exception:
-            self.rollback()
-            raise
-
     def rollback(self):
         errors = []
         while self._rollback:
             callback = self._rollback.pop()
             try:
                 callback()
-            except Exception as exc:  # preserve the original builder failure
+            except Exception as exc:  # Preserve the original builder failure.
                 errors.append(exc)
         if errors:
             detail = "; ".join(str(item) for item in errors)

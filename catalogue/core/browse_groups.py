@@ -13,61 +13,40 @@ ALL_GROUP = "__ALL__"
 
 _GROUPS = {'Swing & Oscillate': ({'id': 'sine_pendulum',
                         'label': 'Sine & Pendulum',
-                        'description': 'Smooth sine and cosine cycles, '
-                                       'offsets, and ping-pong motion.',
+                        'description': 'Smooth back-and-forth oscillation.',
                         'template_ids': ('sine_osc',)},
                        {'id': 'waveforms',
                         'label': 'Waveforms',
-                        'description': 'Sawtooth, reverse, triangle, and '
-                                       'square wave shapes.',
+                        'description': 'Sawtooth and triangle wave shapes.',
                         'template_ids': ('sawtooth', 'triangle_wave')}),
  'Light & Flicker': ({'id': 'blink_strobe',
                       'label': 'Blink & Strobe',
-                      'description': 'Simple, double, triple, and rapid '
-                                     'strobe flashes.',
+                      'description': 'Simple on/off blinking.',
                       'template_ids': ('simple_blink',)},
                      {'id': 'flicker_electrical',
                       'label': 'Flicker & Electrical',
-                      'description': 'Candle, neon, lightning, and screen '
-                                     'illumination.',
+                      'description': 'Candle-style flicker.',
                       'template_ids': ('candle_flicker',)}),
  'Trigger & State': ({'id': 'one_shot',
                       'label': 'One-shot',
-                      'description': 'Binary Trigger, Binary Window, Smooth '
-                                     'Fade In, and 2 more.',
+                      'description': 'Linear Fade In and Smooth Fade Out.',
                       'template_ids': ('fade_in', 'fade_out')},
                      {'id': 'delay_repeat',
                       'label': 'Delay & Repeat',
-                      'description': 'Delayed Start, Repeating Pulse.',
+                      'description': 'Repeating Pulse.',
                       'template_ids': ('pulse_repeat',)}),
  'RGB & Neon Lighting': ({'id': 'colour_cycling',
                           'label': 'Colour Cycling',
-                          'description': 'Colour Cycling templates.',
+                          'description': 'Colours that cycle over time.',
                           'template_ids': ('rgb_colour_cycle',)},
                          {'id': 'sequenced_chase',
                           'label': 'Sequenced & Chase',
-                          'description': 'Sequenced & Chase templates.',
+                          'description': 'Marquee-style chasing colours.',
                           'template_ids': ('rgb_chase',)},
                          {'id': 'sparkle_flicker',
                           'label': 'Sparkle & Flicker',
-                          'description': 'Sparkle & Flicker templates.',
+                          'description': 'Twinkling colours.',
                           'template_ids': ('rgb_twinkle',)})}
-
-
-def configured_categories():
-    """Return categories that expose curated browse groups."""
-    return tuple(_GROUPS)
-
-
-def groups_for_category(category):
-    """Return defensive copies of the named groups for ``category``."""
-    return [
-        {
-            **group,
-            "template_ids": tuple(group["template_ids"]),
-        }
-        for group in _GROUPS.get(category, ())
-    ]
 
 
 def _visible_groups(category, available_ids=None):
@@ -153,40 +132,3 @@ def templates_for_group(catalogue, category, group_id):
     allowed = set(group["template_ids"])
     return [item for item in category_items if item.get("id") in allowed]
 
-
-def validate_catalogue(catalogue):
-    """Reject missing, duplicated, or stale curated memberships."""
-    by_category = {}
-    all_ids = {item.get("id") for item in catalogue}
-    for item in catalogue:
-        by_category.setdefault(item.get("category"), []).append(item.get("id"))
-
-    errors = []
-    for category, groups in _GROUPS.items():
-        if not 2 <= len(groups) <= 4:
-            errors.append(f"{category}: expected 2-4 groups, found {len(groups)}")
-        grouped = [
-            template_id
-            for group in groups
-            for template_id in group["template_ids"]
-        ]
-        duplicates = sorted({
-            template_id
-            for template_id in grouped
-            if grouped.count(template_id) > 1
-        })
-        if duplicates:
-            errors.append(f"{category}: duplicate ids {', '.join(duplicates)}")
-        unknown = sorted(set(grouped) - all_ids)
-        if unknown:
-            errors.append(f"{category}: unknown ids {', '.join(unknown)}")
-        expected = set(by_category.get(category, ()))
-        missing = sorted(expected - set(grouped))
-        extras = sorted(set(grouped) - expected)
-        if missing:
-            errors.append(f"{category}: missing ids {', '.join(missing)}")
-        if extras:
-            errors.append(f"{category}: foreign ids {', '.join(extras)}")
-
-    if errors:
-        raise ValueError("Invalid curated browse groups:\n" + "\n".join(errors))

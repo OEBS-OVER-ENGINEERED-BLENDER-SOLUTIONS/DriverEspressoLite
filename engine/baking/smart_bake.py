@@ -1,78 +1,65 @@
-"""Reduce a densely sampled curve to the keys that actually carry the motion.
+"""Reduce a densely sampled curve to the keys that carry the motion.
 
-A plain bake writes a keyframe on every frame, because that is the only way to
-be certain the curve is reproduced. It is also, for most motion, enormously
-wasteful: an eased open-hold-close is a ramp, a plateau and a ramp, which an
-animator would key four times.
-
-This module is self-contained: it imports nothing but ``bpy`` and knows nothing
-about drivers, templates or add-on state. Its input is a list of
-``(frame, value)`` samples; its output is which of them to key and how each key
+A plain bake writes a keyframe on every frame, which reproduces the curve but is
+wasteful for most motion: an eased open-hold-close is a ramp, a plateau and a ramp,
+which an animator would key four times. This module is self-contained: it imports only
+``bpy`` and knows nothing about drivers, templates or add-on state. Its input is a list
+of ``(frame, value)`` samples; its output is which of them to key and how each key
 should behave.
 
     keys, spec, error = plan(samples, tolerance_fraction=0.01, passes=2)
     if keys is not None:
         apply_plan(fcurve, samples, keys, spec)
 
-Three stages, each decided by measuring the fit rather than by a rule about
-what curves usually look like:
+Three stages, each decided by measuring the fit:
 
-  1. FIT     Seed the keys no error metric can be trusted to find - the ends,
-             every true turn, and every corner where motion meets a flat. Then
-             pin the single worst-fitting frame, repeatedly, until nothing is
-             off by more than the tolerance.
-  2. TYPE    Choose interpolation per segment and a handle per key SIDE.
-  3. PRUNE   Re-test every key now that the types are right, since stage 1
-             buys keys to paper over bows the chosen types no longer produce.
+1. FIT: seed the keys no error metric can be trusted to find (the ends, every true turn,
+   and every corner where motion meets a flat), then pin the worst-fitting frame
+   repeatedly until nothing is off by more than the tolerance.
+2. TYPE: choose interpolation per segment and a handle per key side.
+3. PRUNE: re-test every key now that the types are right, since stage 1 adds keys to
+   cover bows the chosen types no longer produce.
 
-Stages 2 and 3 repeat as a cycle, ``passes`` times, stopping early once nothing
-changes, so a high pass count costs nothing on a curve that has settled.
+Stages 2 and 3 repeat ``passes`` times, stopping early once nothing changes.
 
-Handle POSITIONS, not just handle types
----------------------------------------
-Blender's computed handles (Auto, Auto Clamped, Vector) cannot express "arrive
-on a slope of -0.8 and leave on +0.4", which is what a ball's touchdown is, and
-Auto Clamped flattens at a local minimum, which fights an impact. So a handle
-may also be placed directly, from the slope the samples have at that frame. A
-cubic Bezier with correct end tangents reproduces any cubic exactly, and a
-parabola is a cubic, so a bounce arc costs two or three keys once the tangents
-are right; the touchdown becomes a true cusp, and FREE handles are the only
-kind that can hold two different slopes at one key.
+Handle positions, not just handle types. Blender's computed handles (Auto, Auto Clamped,
+Vector) cannot express arriving on a slope of -0.8 and leaving on +0.4, which is what a
+ball's touchdown is, and Auto Clamped flattens at a local minimum, which fights an
+impact. A handle may therefore be placed directly, from the slope the samples have at
+that frame. A cubic Bezier with correct end tangents reproduces any cubic exactly, and a
+parabola is a cubic, so a bounce arc takes two or three keys; the touchdown becomes a
+true cusp, and free handles are the only kind that can hold two different slopes at one
+key. Two tangent flavours are offered per side and the optimiser picks by measurement:
+SMOOTH (central difference, the exact derivative of a quadratic) and SHARP (one-sided,
+what a corner needs).
 
-Two tangent flavours are offered per side and the optimiser picks by
-measurement: SMOOTH (central difference, the exact derivative of a quadratic)
-and SHARP (one-sided, what a corner needs).
+Rules the fitter follows:
 
-Rules the fitter follows
-------------------------
-  * Every stage-1 baseline is tried and the cheapest kept, because the baseline
-    decides whether stage 1 converges at all.
-  * A handle reshapes the segments on BOTH sides of its key, so a change that
-    scores well against its own segment can still push the curve over
-    tolerance. Every change commits only if the whole curve still passes.
-  * The metric is always WORST-frame error, never average. An average hides the
-    events that matter: drop a one-frame muzzle flash from a 200-frame bake and
-    the average barely moves, while the flash is gone.
+* Every stage-1 baseline is tried and the cheapest kept, because the baseline decides
+  whether stage 1 converges at all.
+* A handle reshapes the segments on both sides of its key, so a change is committed only
+  if the whole curve still passes.
+* The metric is always worst-frame error, never average, because an average hides events
+  that matter, such as a one-frame flash.
 
-What this cannot do is invent redundancy that is not there. Layered vibration
-changes every frame and so needs a key on every frame. That is the correct
-answer, and anything fewer would mean motion was dropped.
+This cannot invent redundancy that is not there: layered vibration changes every frame
+and needs a key on every frame.
 """
 
 from __future__ import annotations
 
 import bpy
 
-# Handle candidates offered per key SIDE.
+# Handle candidates offered per key side. The three computed types are Blender's own.
+# The two FREE flavours place the handle explicitly along the slope the samples have:
 #
-# The three computed types are Blender's own. The two FREE flavours place the
-# handle explicitly along the slope the samples actually have:
-#   FREE_SMOOTH  central difference - the exact derivative of a quadratic, so
-#                it reproduces an eased arc with almost no keys.
-#   FREE_SHARP   one-sided - the slope on THIS side only, which is what makes a
-#                touchdown a corner instead of a rounded dip.
-# ALIGNED is not offered: it forces both sides collinear, which is the one thing
-# a cusp must not be.
+# * FREE_SMOOTH: central difference, the exact derivative of a quadratic, so an eased
+#   arc fits with almost no keys.
+# * FREE_SHARP: one-sided, the slope on this side only, which makes a touchdown a corner
+#   instead of a rounded dip.
+#
+# ALIGNED is not offered: it forces both sides collinear, which is what a cusp must not
+# be.
 HANDLE_CANDIDATES = ("AUTO_CLAMPED", "AUTO", "VECTOR", "FREE_SMOOTH", "FREE_SHARP")
 
 _BLENDER_HANDLE = {
@@ -83,10 +70,10 @@ _BLENDER_HANDLE = {
     "FREE_SHARP": "FREE",
 }
 
-# Interpolation per segment. Blender's easing modes (Sinusoidal, Quartic) and
-# dynamic effects (Back, Bounce, Elastic) are omitted on purpose - they are
-# fixed parametric shapes, and fitting real motion to Blender's idealised BOUNCE
-# would replace measured motion with a preset that merely resembles it.
+# Interpolation per segment. Blender's easing modes (Sinusoidal, Quartic) and dynamic
+# effects (Back, Bounce, Elastic) are omitted on purpose: they are fixed parametric
+# shapes, and fitting real motion to them would replace the motion with a preset that
+# merely resembles it.
 INTERPOLATIONS = ("CONSTANT", "LINEAR", "BEZIER")
 
 # Baselines stage 1 fits from. Whichever converges on fewest keys wins, and
@@ -122,17 +109,11 @@ def fcurve_of(obj):
     return None
 
 
-_fcurve_of = fcurve_of  # callers written against the old name
-
-
 def slopes(samples):
-    """Per-sample derivative, three ways, in value units per frame.
-
-    ``smooth`` is the central difference - for a quadratic this is not an
-    approximation, it is the exact derivative, which is why an eased arc fits so
-    cheaply. ``left`` and ``right`` are one-sided and differ from each other
-    only where the curve actually corners; that difference is what a touchdown
-    is made of.
+    """Per-sample derivative, three ways, in value units per frame. ``smooth`` is the
+    central difference, which for a quadratic is the exact derivative, so an eased
+    arc fits cheaply. ``left`` and ``right`` are one-sided and differ only where the
+    curve corners; that difference is what a touchdown is made of.
     """
     count = len(samples)
     out = []
@@ -201,14 +182,11 @@ def apply_plan(fcurve, samples, keys, spec, curve_slopes=None):
 class _Curve:
     """A scratch F-curve used to ask Blender what a key set evaluates to.
 
-    Fitting against a hand-written Bezier would mean re-deriving Blender's
-    handle solver and matching it exactly; any drift would show up as a curve
-    that measured clean here and looked wrong in the viewport. Asking Blender is
-    the only answer that cannot disagree with Blender.
-
-    Everything here is about not rebuilding. Throwing the action away and
-    re-inserting every key for each of the hundreds of candidates a fit tries
-    would dominate the runtime.
+    Fitting against a hand-written Bezier would mean re-deriving Blender's handle solver
+    exactly, and any drift would show as a curve that fit cleanly here but looked wrong
+    in the viewport; asking Blender cannot disagree with Blender. The curve is reused
+    rather than rebuilt, because discarding the action and re-inserting every key for
+    each of the hundreds of candidates a fit tries would dominate the runtime.
     """
 
     def __init__(self, samples):
@@ -281,18 +259,13 @@ class _Curve:
         return worst_index, worst_error
 
     def excursion(self, step=0.25):
-        """How far the curve travels OUTSIDE the range the samples occupied.
+        """How far the curve travels outside the range the samples occupied.
 
-        Error measured at sample frames cannot see this: a tangent handle bulges
-        BETWEEN frames, so a curve can pass through every sample within
-        tolerance and still swing well past the highest value the driver ever
-        produced. Measured, that is exactly what happened once handles gained
-        positions - three templates started inventing motion (a wing flap
-        overshot by 0.072) while every sampled frame remained inside tolerance.
-
-        This is not pedantry: a ball that dips below the floor between two keys,
-        or a light brighter than its own maximum, is motion the artist never
-        asked for. Sub-frame steps are also what a motion-blurred render reads.
+        Error measured at sample frames cannot see this: a tangent handle bulges between
+        frames, so a curve can pass through every sample within tolerance and still
+        swing past the highest value the driver ever produced. A ball that dips below
+        the floor between two keys, or a light brighter than its own maximum, is motion
+        nobody asked for, and sub-frame steps are what a motion-blurred render reads.
         """
         evaluate = self.fcurve.evaluate
         low, high = self.low, self.high
@@ -350,15 +323,6 @@ def seed_indices(samples, eps=_FLAT_EPSILON):
         if turns or meets_flat:
             keep.add(i)
     return keep
-
-
-def is_turn(samples, i, eps=_FLAT_EPSILON):
-    """A local maximum or minimum - a peak that must not be overshot."""
-    if i <= 0 or i >= len(samples) - 1:
-        return False
-    before = samples[i][1] - samples[i - 1][1]
-    after = samples[i + 1][1] - samples[i][1]
-    return (before > eps and after < -eps) or (before < -eps and after > eps)
 
 
 def _fit(curve, tolerance, max_keys, candidate):
@@ -510,17 +474,16 @@ def plan(samples, *, tolerance_fraction=0.01, passes=DEFAULT_PASSES, min_saving=
 
     curve = _Curve(samples)
     try:
-        # A baseline qualifies only if its fit holds the WHOLE contract. Stage 1
-        # measures error at sample frames, which cannot see a tangent handle
-        # bulging between them, so a baseline that fits beautifully and
-        # overshoots is rejected here rather than discovered downstream.
+        # A baseline qualifies only if its fit holds the whole contract. Stage 1
+        # measures error at sample frames, which cannot see a tangent handle bulging
+        # between them, so a baseline that fits but overshoots is rejected here.
         best_keys, baseline, best_error = None, None, 0.0
         for candidate in BASELINES:
             attempt = _fit(curve, tolerance, max_keys, candidate)
             if attempt is None:
                 continue
             curve.reset(attempt)
-            trial = curve.uniform(candidate)
+            curve.uniform(candidate)
             ok, error = curve.holds(tolerance, allowance)
             if not ok:
                 continue

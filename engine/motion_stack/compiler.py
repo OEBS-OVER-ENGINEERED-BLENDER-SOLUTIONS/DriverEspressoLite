@@ -7,10 +7,7 @@ from enum import Enum
 import re
 from typing import Mapping, Tuple
 
-try:
-    from .stack import BlendMode, MotionStack, StackLayer, resolve_active_layers
-except ImportError:  # Direct-file loading keeps schema tests independent of bpy.
-    from espresso_mgx_stack import BlendMode, MotionStack, StackLayer, resolve_active_layers
+from .stack import BlendMode, MotionStack, StackLayer, resolve_active_layers
 
 
 class CompilationRoute(str, Enum):
@@ -39,8 +36,6 @@ def _weighted(layer: StackLayer) -> str:
     expression = layer.expression
     if layer.weight == 1.0:
         return expression
-    if layer.blend is BlendMode.MULTIPLY:
-        return "(1+(%s-1)*%g)" % (expression, layer.weight)
     return "((%s)*%g)" % (expression, layer.weight)
 
 
@@ -50,36 +45,13 @@ def _compose(layers: Tuple[StackLayer, ...]) -> str:
         value = _weighted(layer)
         if layer.blend is BlendMode.REPLACE:
             result = value
-        elif layer.blend is BlendMode.ADD:
+        else:
             result = "((%s)+(%s))" % (result, value)
-        elif layer.blend is BlendMode.MULTIPLY:
-            result = "((%s)*(%s))" % (result, value)
-        elif layer.blend is BlendMode.MAX:
-            result = "max((%s),(%s))" % (result, value)
-        elif layer.blend is BlendMode.MIN:
-            result = "min((%s),(%s))" % (result, value)
     return result
 
 
 def _compose_aliases(layers: Tuple[StackLayer, ...]) -> str:
-    aliased = tuple(
-        StackLayer(
-            layer_id=layer.layer_id,
-            effect_id=layer.effect_id,
-            label=layer.label,
-            channel=layer.channel,
-            expression="s%d" % index,
-            blend=layer.blend,
-            baseline=layer.baseline,
-            weight=layer.weight,
-            muted=layer.muted,
-            solo=layer.solo,
-            mask=layer.mask,
-            route_hint=layer.route_hint,
-            variables=layer.variables,
-        )
-        for index, layer in enumerate(layers)
-    )
+    aliased = tuple(replace(layer, expression="s%d" % index) for index, layer in enumerate(layers))
     return _compose(aliased)
 
 

@@ -25,7 +25,6 @@ def descriptor_key(value):
     ))
 
 
-BUCKET_STRUCTURES = "bucket:structures"
 BUCKET_MOTIONS = "bucket:motions"
 _HOST_SCOPED = frozenset({"SCENE", "LAST"})
 
@@ -52,28 +51,6 @@ def matches_list_search(item, filter_name=None):
     label = item["label"] if isinstance(item, dict) else getattr(item, "label", "")
     return text in str(label or "").lower()
 
-_ROUTE_COMPACT = {
-    "OBJECT_SET_NATIVE": "Driver",
-    "PREPARED_LAYOUT_GN": "GN",
-    "GENERATED_GRAPHIC_NATIVE": "GN",
-    "SHOWCASE_HYBRID": "Hybrid",
-    "TRAVEL_REVEAL_HYBRID": "Hybrid",
-    "EVENT_TRACK_NATIVE": "Action",
-}
-
-
-def _bucket_key(effect_kind):
-    if effect_kind == "STRUCTURAL_EFFECT":
-        return BUCKET_STRUCTURES
-    return BUCKET_MOTIONS
-
-
-def _bucket_key_for_group(group):
-    metadata = group.get("metadata")
-    if not metadata:
-        return BUCKET_MOTIONS
-    return _bucket_key(metadata.get("effect_kind", "SINGLE_PROPERTY"))
-
 
 def _category_row_key(bucket_key, category_name):
     return "category:%s:%s" % (bucket_key.split(":", 1)[-1], category_name)
@@ -87,9 +64,6 @@ def catalogue_category_for_group(group):
         if key.startswith("category:"):
             return key.split(":", 1)[1]
         return "Other"
-    effect_kind = metadata.get("effect_kind", "SINGLE_PROPERTY")
-    if effect_kind == "STRUCTURAL_EFFECT":
-        return ""
     template_id = str(metadata.get("template_id") or "")
     if not template_id:
         template = metadata.get("template")
@@ -100,42 +74,6 @@ def catalogue_category_for_group(group):
         if entry:
             return entry[0]
     return "Other"
-
-
-def compact_route_label(metadata):
-    """Compact delivery-route badge for one applied effect."""
-    if not metadata:
-        return "Driver"
-    if metadata.get("child_effect_kind") == "SPATIAL_EFFECTOR":
-        return "Effector"
-    if metadata.get("child_effect_kind") == "SHAPE_ADAPTATION":
-        return "Layout · GN"
-    # An authoring rig is neither Geometry Nodes nor a layout. It builds objects, an
-    # aim constraint and drivers -- there is no node tree anywhere in it.
-    # Every GENERATED_SETUP was badged "GN" and every STRUCTURAL_EFFECT
-    # "Layout · GN", so filing the rig as a structure moved it from claiming a
-    # node tree to claiming a node tree AND a layout. "GN" means Geometry
-    # Nodes; this has none.
-    effect_kind = metadata.get("effect_kind", "SINGLE_PROPERTY")
-    if effect_kind == "STRUCTURAL_EFFECT":
-        return "Layout · GN"
-    route_name = str(metadata.get("route") or "")
-    if route_name == "Prepared Layout":
-        return "Layout · GN"
-    template_id = str(metadata.get("template_id") or "")
-    if not template_id:
-        template = metadata.get("template")
-        template_id = str((template or {}).get("id") or "")
-    if template_id:
-        from ...engine.motion_stack import capabilities
-        item = capabilities.get(template_id)
-        if item:
-            return _ROUTE_COMPACT.get(item.route, "GN")
-    if effect_kind == "MOTION_SET":
-        return "Driver"
-    if effect_kind == "GENERATED_SETUP":
-        return "GN"
-    return "Driver"
 
 
 def _plain_host_name(text):
@@ -237,12 +175,8 @@ def host_visibility_badge(host):
 
 
 def _bucket_row(bucket_key, nest_depth=0, visible=True):
-    if bucket_key == BUCKET_STRUCTURES or bucket_key.startswith(BUCKET_STRUCTURES + ":"):
-        label, icon = "Structures", "MOD_ARRAY"
-    else:
-        label, icon = "Motions", "DRIVER"
     return _container_row(
-        "BUCKET", bucket_key, label, icon, nest_depth, visible,
+        "BUCKET", bucket_key, "Motions", "DRIVER", nest_depth, visible,
     )
 
 
@@ -254,11 +188,6 @@ def _category_row(category_key, label, member_count, visible, nest_depth=1):
         "CATEGORY", category_key, label, "OUTLINER_COLLECTION",
         nest_depth, visible, count_label, member_count,
     )
-
-
-def descendants_in_bucket(items, bucket_key):
-    """Return rows nested under one Structures or Motions parent."""
-    return descendants_under_row(items, bucket_key)
 
 
 def descendants_under_row(items, anchor_key):
@@ -336,35 +265,16 @@ def metadata_for_descriptor(target):
         "parameter_values": dict(values or {}),
         "entry": entry,
         "editable": editable,
-        "removable": template is not None,
+        "removable": True,
         "effect_kind": effect_kind,
         "record_token": applied_motion.entry_token(host, record),
     }
 
 
-def foreign_live_motion_for_channel(owner, data_path, index):
-    """Return a live channel's unavailable applied-motion metadata, if any."""
-    animation = getattr(owner, "animation_data", None)
-    if animation is None:
-        return None
-    curve = (
-        animation.drivers.find(data_path, index=index)
-        if index >= 0 else animation.drivers.find(data_path)
-    )
-    if curve is None:
-        return None
-    descriptor = target_memory.serialize_target(owner, data_path, index)
-    metadata = metadata_for_descriptor(descriptor) if descriptor else None
-    if metadata and applied_motion.resolve_template(metadata["record"]) is None:
-        return metadata
-    return None
-
-
-def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
+def rows_for_targets(targets, group_state=None, source="ACTIVE"):
     """Flatten grouped presentation rows over an authoritative target list."""
     group_state = dict(group_state or {})
     groups = OrderedDict()
-    effects = list(effects or ())
     for target in targets:
         target = dict(target)
         metadata = metadata_for_descriptor(target)
@@ -399,41 +309,7 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
         })
         group["targets"].append(enriched)
 
-    for effect in effects:
-        if (effect["effect_kind"] not in {"GENERATED_SETUP", "STRUCTURAL_EFFECT"}
-                and not effect.get("child_effect_kind")):
-            # A child of a setup earns a row on its parent's account. Without
-            # this an authoring rig's Flight Motion vanished the moment it was
-            # correctly typed as a motion rather than a generated setup.
-            continue
-        key = effect["group_key"]
-        icon = "GEOMETRY_NODES"
-        group = groups.setdefault(key, {
-            "key": key, "label": effect["label"], "icon": icon,
-            "metadata": effect, "targets": [],
-        })
-        group["label"] = effect["label"]
-        group["icon"] = icon
-        group["metadata"] = {**(group.get("metadata") or {}), **effect}
-
-    child_groups = OrderedDict()
-    root_groups = []
-    for group in groups.values():
-        metadata = group.get("metadata") or {}
-        parent_token = str(metadata.get("parent_record_token") or "")
-        if parent_token:
-            child_groups.setdefault("effect:%s" % parent_token, []).append(group)
-        else:
-            root_groups.append(group)
-
-    structure_groups = []
-    motion_groups = []
-    for group in root_groups:
-        bucket = _bucket_key_for_group(group)
-        if bucket == BUCKET_STRUCTURES:
-            structure_groups.append(group)
-        else:
-            motion_groups.append(group)
+    motion_groups = list(groups.values())
 
     rows = []
 
@@ -443,9 +319,7 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
             metadata.get("effect_kind", "SINGLE_PROPERTY")
             if metadata else "SINGLE_PROPERTY"
         )
-        group_batch = effect_kind in {
-            "GENERATED_SETUP", "STRUCTURAL_EFFECT", "MOTION_SET",
-        } and not bool(metadata.get("child_effect_kind"))
+        group_batch = effect_kind == "MOTION_SET"
         label = group["label"]
         _host_key, host_name = _host_key_and_label(group)
         omit_host = source in _HOST_SCOPED
@@ -453,7 +327,7 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
         group_visible = ancestors_open
         child_visible = ancestors_open and group_open
         catalogue_category = catalogue_category_for_group(group)
-        route_badge = compact_route_label(metadata)
+        route_badge = "Driver"
         if show_category_in_badge and catalogue_category:
             badge_text = "%s · %s" % (catalogue_category, route_badge)
         else:
@@ -484,14 +358,6 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
             if omit_host:
                 child["label"] = _child_destination_label(child.get("label"), host_name)
             rows.append(child)
-        for child_group in sorted(
-                child_groups.get(group["key"], ()),
-                key=lambda item: item["label"].lower()):
-            append_group(
-                child_group, child_visible,
-                show_category_in_badge=False,
-                nest_depth=nest_depth + 1,
-            )
 
     def append_motion_groups(bucket_groups, bucket_open, bucket_key, group_depth):
         by_category = OrderedDict()
@@ -515,20 +381,7 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
                     nest_depth=group_depth + (1 if use_category_parent else 0),
                 )
 
-    def emit_type_buckets(structure_groups, motion_groups, ancestors_open, base_depth, key_suffix=""):
-        if structure_groups:
-            bucket_key = (
-                "%s:%s" % (BUCKET_STRUCTURES, key_suffix) if key_suffix else BUCKET_STRUCTURES
-            )
-            rows.append(_bucket_row(
-                bucket_key, nest_depth=base_depth, visible=ancestors_open,
-            ))
-            bucket_open = ancestors_open and group_state.get(bucket_key, True)
-            for group in sorted(structure_groups, key=lambda item: item["label"].lower()):
-                append_group(
-                    group, bucket_open, show_category_in_badge=False,
-                    nest_depth=base_depth + 1,
-                )
+    def emit_type_buckets(motion_groups, ancestors_open, base_depth, key_suffix=""):
         if motion_groups:
             bucket_key = (
                 "%s:%s" % (BUCKET_MOTIONS, key_suffix) if key_suffix else BUCKET_MOTIONS
@@ -543,10 +396,10 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
 
     if source in _HOST_SCOPED:
         by_host = OrderedDict()
-        for group in root_groups:
+        for group in motion_groups:
             host_key, host_label = _host_key_and_label(group)
             slot = by_host.setdefault(host_key, {
-                "label": host_label, "structures": [], "motions": [], "host": None,
+                "label": host_label, "motions": [], "host": None,
             })
             if slot["host"] is None:
                 slot["host"] = (group.get("metadata") or {}).get("host")
@@ -556,10 +409,7 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
                     if name and name in bpy.data.objects:
                         slot["host"] = bpy.data.objects[name]
                         break
-            if _bucket_key_for_group(group) == BUCKET_STRUCTURES:
-                slot["structures"].append(group)
-            else:
-                slot["motions"].append(group)
+            slot["motions"].append(group)
         for host_key, slot in sorted(
                 by_host.items(), key=lambda item: item[1]["label"].lower()):
             rows.append(_host_row(
@@ -568,11 +418,11 @@ def rows_for_targets(targets, group_state=None, effects=None, source="ACTIVE"):
             ))
             host_open = group_state.get(host_key, True)
             emit_type_buckets(
-                slot["structures"], slot["motions"],
-                ancestors_open=host_open, base_depth=1, key_suffix=host_key,
+                slot["motions"], ancestors_open=host_open, base_depth=1,
+                key_suffix=host_key,
             )
     else:
-        emit_type_buckets(structure_groups, motion_groups, True, 0, "")
+        emit_type_buckets(motion_groups, True, 0, "")
 
     return rows
 
@@ -607,7 +457,7 @@ def descriptors_from_items(items, selected_only=True):
 
 
 def effect_tokens_from_items(items, selected_only=True):
-    """Selected atomic effects represented by generated or structural rows."""
+    """Selected atomic effects represented by effect rows."""
     result = []
     seen = set()
     for item in items:

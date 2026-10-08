@@ -63,8 +63,8 @@ def host_is_alive(host):
 
     Embedded material, world, and light node trees are not in
     ``bpy.data.node_groups``. Treating a missing node-groups lookup as 'dead'
-    made Clear Applied Motion skip Stack Fill / Position Wave and report a
-    successful zero-item clear.
+    made Clear Applied Motion skip those drivers and report a successful
+    zero-item clear.
     """
     if host is None:
         return False
@@ -86,9 +86,9 @@ def host_is_alive(host):
 
 
 def _target_root(owner):
-    # Walk up id_data until we reach a self-referential root ID block.
-    # A single hop fails for embedded structs like shader node sockets whose
-    # id_data is the NodeTree (not in bpy.data.node_groups), not the Material.
+    # Walk up id_data to the root ID block. A single hop is not enough for embedded
+    # structs such as shader node sockets, whose id_data is the NodeTree (not in
+    # bpy.data.node_groups) rather than the Material.
     current = getattr(owner, "id_data", None)
     if current is None:
         return owner
@@ -338,6 +338,26 @@ def remember_live_entry(context, entry):
     remember_entry(context, entry)
 
 
+def _layered_by_stack(host, code, path):
+    """True when this apply was layered into a Motion Stack that now owns the channel.
+
+    The stack keeps its own record (and the helper behind it). Stamping the
+    new recipe over the same channel would take the channel from the stack and
+    leave the stack's helper object stranded.
+    """
+    from ..motion import applied_motion, stack_records
+    from ...engine.motion_stack.stack import MotionStack
+
+    for record in applied_motion.read(host):
+        payload = stack_records.stack_from_extras(record.get("extras") or {})
+        if not payload or [path[0], path[1]] not in [list(p) for p in applied_motion.paths_of(record)]:
+            continue
+        layers = MotionStack.from_dict(payload).layers
+        if layers and layers[-1].effect_id == code:
+            return True
+    return False
+
+
 def remember_targets(context, targets, display_label, apply_kind, template_id="", template_name="", target_states=None, template_values=None):
     if template_values is None:
         template_values = _current_template_values(context, template_id)
@@ -346,12 +366,9 @@ def remember_targets(context, targets, display_label, apply_kind, template_id=""
         target_states=target_states, template_values=template_values,
     )
     if entry and template_id:
-        props = getattr(getattr(context, "scene", None), "espresso_props", None)
-        if props is not None and getattr(props, "last_template_id", "") == template_id:
-            entry["application_mode"] = getattr(props, "application_mode", "SINGLE")
         try:
             from ...catalogue import templates
-            from . import application_plan, source_binding
+            from . import application_plan
 
             template = templates.TEMPLATE_BY_ID.get(template_id) or {}
             channels = tuple(template.get("channels") or ())
@@ -360,16 +377,11 @@ def remember_targets(context, targets, display_label, apply_kind, template_id=""
                     record["channel_id"] = str(
                         channel.get("id") or channel.get("channel_id") or ""
                     )
-            source = source_binding.latest_source(props) if props is not None else None
-            plan = application_plan.from_entry({
-                **entry,
-                "source_entry": source or {},
-                "source_required": source_binding.needs_input_source(template),
-            }, template)
+            plan = application_plan.from_entry(entry, template)
             entry.update(application_plan.entry_metadata(plan))
         except (AttributeError, KeyError, TypeError, ValueError):
-            # A successfully applied legacy/custom route still remains usable;
-            # it will be inferred read-only when the plan is next inspected.
+            # A route that applied but cannot be described stays usable; its plan is
+            # inferred read-only when next inspected.
             pass
     # Persistent effect metadata enriches the real-driver Active manager.  The
     # F-curve remains the authority on whether a row exists; this record only
@@ -389,9 +401,20 @@ def remember_targets(context, targets, display_label, apply_kind, template_id=""
                 host = resolved.get("owner")
                 if host is None:
                     continue
-                by_host.setdefault(id(host), (host, []))[1].append(
-                    [resolved["data_path"], int(resolved["index"])]
-                )
+                data_path = resolved["data_path"]
+                root = getattr(host, "id_data", None)
+                if root is not None and root != host:
+                    # A node socket, a pose bone: the driver and its stamp live on
+                    # the datablock that owns it, at the path from there.
+                    try:
+                        data_path = host.path_from_id(data_path)
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                    host = root
+                path = [data_path, int(resolved["index"])]
+                if _layered_by_stack(host, code, path):
+                    continue
+                by_host.setdefault(id(host), (host, []))[1].append(path)
             extras = {
                 "template_id": template_id,
                 "parameter_values": json_safe_values(template_values),
@@ -403,7 +426,6 @@ def remember_targets(context, targets, display_label, apply_kind, template_id=""
             # Bookkeeping must never invalidate a successfully assigned driver.
             pass
     remember_entry(context, entry)
-
 
 
 def forget_latest(props):
@@ -419,7 +441,6 @@ def forget_latest(props):
     write_store(props, store)
 
 
-
 def bone_name_from_path(data_path):
     """The bone a driver path belongs to, or "" for an object-level one."""
     marker = 'pose.bones["'
@@ -432,12 +453,10 @@ def bone_name_from_path(data_path):
 
 
 def destination_count(entry):
-    """How many places this apply landed, as the ARTIST counts them.
-
-    Not the number of channels. A blink on one eyelid is four quaternion
-    drivers, and calling that "4 targets" reads as four bones. What the artist
-    picked was one bone, so that is what gets counted - distinct object-and-bone
-    destinations, however many channels each carries.
+    """How many places this apply landed, as the artist counts them, not the number of
+    channels. A blink on one eyelid is four quaternion drivers but one bone, so
+    distinct object-and-bone destinations are counted, however many channels each
+    carries.
     """
     seen = set()
     for target in (entry or {}).get("targets") or []:
@@ -451,12 +470,6 @@ def latest_entry(props):
     store = read_store(props)
     latest = store.get("latest")
     return latest if isinstance(latest, dict) and latest.get("targets") else None
-
-
-def recent_template_entry(props, template_id):
-    store = read_store(props)
-    entry = (store.get("recent_templates") or {}).get(template_id)
-    return entry if isinstance(entry, dict) and entry.get("targets") else None
 
 
 def _candidate_entries(props):
@@ -515,11 +528,9 @@ def latest_label(props):
 def _resolved_display_label(entry):
     """Build a fresh human label from the remembered target itself.
 
-    Stored display captions are useful as historical context, but they can go
-    stale when a generic apply route remembered a friendly batch caption like
-    "1 lights > Constant Speed". The target list below the tooltip already
-    resolves the real remembered target; the tooltip should describe that same
-    destination instead of trusting the old caption.
+    Stored captions can go stale (a batch caption such as "1 lights > Constant Speed"
+    outlives the target it described), so the tooltip describes the destination the
+    target list resolves instead.
     """
     targets = list((entry or {}).get("targets") or ())
     if not targets:
@@ -590,8 +601,8 @@ def latest_info_lines(props):
     return lines
 
 
-# Fast path: map the most common ID type names straight to their bpy.data
-# collection so we do not scan every attribute of bpy.data on each lookup.
+# Fast path: map common ID type names straight to their bpy.data collection instead of
+# scanning every attribute of bpy.data.
 _ID_TYPE_TO_COLLECTION = {
     "Object": "objects",
     "Mesh": "meshes",
@@ -788,32 +799,16 @@ def canonical_driver_channel(target):
 
 
 def capture_cleanup_for_fcurves(fcurves, props=None):
-    """Inventory owned helpers before public F-Curves disappear."""
-    from ..setups import internal_helpers
+    """Describe the targets whose drivers are about to disappear."""
 
     descriptors = []
-    helper_resources = []
-    bindings = {}
-    if props is not None:
-        from ...ui import live_controls
-
-        bindings = live_controls.read_bindings(props)
     for fcurve in fcurves or ():
         descriptor = serialize_target(
             getattr(fcurve, "id_data", None), fcurve.data_path, fcurve.array_index,
         )
         if descriptor:
             descriptors.append(descriptor)
-        helper_resources.extend(internal_helpers.resources_from_driver(fcurve.driver))
-        if props is not None and descriptor:
-            from ...ui import live_controls
-
-            binding = bindings.get(live_controls._target_key(descriptor))
-            if binding:
-                helper_resources.extend(internal_helpers.resources_from_snapshot(
-                    binding.get("original"), _find_id_block,
-                ))
-    return {"targets": descriptors, "helpers": helper_resources}
+    return {"targets": descriptors}
 
 
 def capture_cleanup_for_entry(entry, props=None):
@@ -842,6 +837,20 @@ def capture_cleanup_for_targets(targets, props=None):
     return capture_cleanup_for_fcurves(fcurves, props)
 
 
+def controller_bound_targets(targets, props):
+    """Descriptors of the targets that currently wear an attached Controller."""
+    if props is None:
+        return []
+    from ...ui.state import live_controls
+
+    bound = live_controls.read_bindings(props)
+    inventory = capture_cleanup_for_targets(targets, props)
+    return [
+        descriptor for descriptor in inventory.get("targets", ())
+        if live_controls._target_key(descriptor) in bound
+    ]
+
+
 def entry_overlaps_targets(entry, targets):
     """Whether remembered live state refers to any explicitly removed target."""
     remembered = {
@@ -854,9 +863,8 @@ def entry_overlaps_targets(entry, targets):
 
 
 def cleanup_captured_resources(captured, scene=None, props=None):
-    from ..setups import internal_helpers
+    """Forget the Live controller bindings of targets that lost their driver."""
 
-    helper_count = internal_helpers.cleanup((captured or {}).get("helpers", []))
     controller_count = 0
     if scene is not None and props is not None:
         from ...ui import live_controls
@@ -864,39 +872,15 @@ def cleanup_captured_resources(captured, scene=None, props=None):
         controller_count = live_controls.discard_bindings_for_targets(
             scene, props, (captured or {}).get("targets", []),
         )
-    return helper_count, controller_count
-
-
-def cleanup_entry_node_groups(entry):
-    """Remove generated Espresso groups connected to remembered node targets."""
-    from ..spatial import shared_material_sweep
-
-    removed = 0
-    for target in (entry or {}).get("targets", []):
-        resolved, _reason = resolve_target_record(target)
-        if not resolved:
-            continue
-        owner = resolved["owner"]
-        data_path = resolved["data_path"]
-        if shared_material_sweep.remove_group_for_driver_path(owner, data_path):
-            removed += 1
-        elif shared_material_sweep.remove_group_feeding_target_path(
-            owner, data_path,
-        ):
-            removed += 1
-    return removed
+    return controller_count
 
 
 def apply_expression_to_entry(
-    entry, expression, template, source_entry=None, scene=None,
+    entry, expression, template, scene=None,
     rest_start_mode=None, output_baseline=None, validation_template=None,
     prepare_driver=None,
 ):
     original_target_records = copy.deepcopy((entry or {}).get("targets", []))
-    if (entry or {}).get("apply_kind") == "node_route":
-        return False, (
-            "Apply with Shared Material again to rebuild this Espresso node setup."
-        )
     resolved, reason = resolve_entry(entry)
     if not resolved:
         return False, reason
@@ -942,10 +926,6 @@ def apply_expression_to_entry(
     )
     if len(expressions) != len(resolved) or len(baselines) != len(resolved):
         return False, "The rebuilt motion channels no longer match the applied targets."
-    pose_driven = any(
-        (target.get("rest_state") or {}).get("pose_delta") is not None
-        for target in resolved
-    )
     from . import application_plan
 
     scalar_broadcast = (
@@ -954,7 +934,7 @@ def apply_expression_to_entry(
     )
     if (
         len(resolved) > 1 and not template.get("channels")
-        and not pose_driven and not scalar_broadcast
+        and not scalar_broadcast
     ):
         label = entry.get("display_label", "the remembered target")
         return False, (
@@ -973,30 +953,13 @@ def apply_expression_to_entry(
         channel_expression = expressions[target_index]
         channel_baseline = baselines[target_index]
 
-        # A pose-driven channel stores its own amplitude. Re-applying has to
-        # rebuild rest + delta*(envelope); pushing the bare envelope would drive
-        # every channel with the same value and flatten the artist's pose into
-        # nothing. The bones are at rest by now, so the entry is the only place
-        # this amplitude still exists.
-        pose_target = bool(existing_state and "pose_delta" in existing_state)
-        if pose_target:
-            from ..motion import pose_capture
-
-            expression_for_target = pose_capture.expression_from_stored_pose(
-                channel_expression,
-                existing_state.get("pose_rest", 0.0),
-                existing_state.get("pose_delta", 0.0),
-            )
-        else:
-            expression_for_target = channel_expression
-        # Reuse the rest_state captured on the original apply rather than
-        # resampling the target's current value: it's already driven by then, so
-        # recapturing here would treat the driven output as the new rest position
-        # and compound further with every Update Last Target click. Only capture
-        # fresh when there is no stored state yet, or the rest mode changed.
+        expression_for_target = channel_expression
+        # Reuse the rest_state captured on the original apply instead of resampling the
+        # target: the target is already driven, so resampling would treat the driven
+        # output as the new rest position and compound on every Update Last Target.
+        # Capture fresh only when no state is stored or the rest mode changed.
         if (
             scene is not None and rest_start_mode is not None
-            and not pose_target
             and (not existing_state or existing_state.get("mode") != rest_start_mode)
         ):
             from . import apply_behavior
@@ -1018,15 +981,13 @@ def apply_expression_to_entry(
         elif (
             scene is not None
             and rest_start_mode == "ADDITIVE"
-            and not pose_target
             and existing_state
             and existing_state.get("mode") == rest_start_mode
         ):
-            # Keep the original captured value/application frame (the
-            # anti-compounding invariant) while rebuilding phase and bounded
-            # normalization metadata from the newly generated expression.
-            # Those derived values legitimately change when a user edits
-            # Minimum, Maximum, Speed, or another kernel parameter.
+            # Keep the original captured value and application frame while rebuilding
+            # the phase and bounded-normalisation metadata from the new expression.
+            # Those derived values change when Minimum, Maximum, Speed or another kernel
+            # parameter is edited.
             target["rest_state"] = utils.capture_rest_start_state(
                 expression_for_target,
                 template,
@@ -1038,29 +999,15 @@ def apply_expression_to_entry(
                 additive_profile=existing_state.get("additive_profile"),
             )
             entry.get("targets", [])[target_index]["rest_state"] = dict(target["rest_state"])
-        # A pose channel carries a whole orientation, not an offset. Rest Start
-        # re-wraps its four quaternion components independently, which both
-        # breaks the unit-length constraint and re-phases the envelope - the
-        # measured symptom was a lid that stopped closing at all after one
-        # Update Last Target. The stored state pins it OFF; honour that over
-        # whatever the panel currently shows.
+        # A pose channel carries a whole orientation, not an offset. Rest Start would
+        # re-wrap its four quaternion components independently, breaking the unit-length
+        # constraint and re-phasing the envelope. The stored state pins it off, and that
+        # wins over what the panel currently shows.
         wrapped_expression = utils.wrap_expression_with_rest_state(
             expression_for_target,
             template,
             target.get("rest_state"),
         )
-        state = target.get('rest_state') or {}
-        if (not pose_target and state.get('application_space') == 'RELATIVE'
-                and state.get('mode', utils.REST_START_OFF) == utils.REST_START_OFF
-                and 'motion_anchor' in state):
-            # Mirror Motion Apply's original relative placement; reading the
-            # currently driven value would accumulate an offset on each edit.
-            anchor = float(state['motion_anchor'])
-            if state.get('motion_data_path', data_path) == 'scale':
-                if anchor != 1.0:
-                    wrapped_expression = f'{utils._format_driver_literal(anchor)}*({wrapped_expression})'
-            elif anchor != 0.0:
-                wrapped_expression = f'{utils._format_driver_literal(anchor)}+({wrapped_expression})'
         valid, message = utils.validate_driver_expression(
             wrapped_expression, validation_template or template, scene,
         )
@@ -1072,25 +1019,17 @@ def apply_expression_to_entry(
     # Build every replacement on a private driver first, then commit the whole
     # remembered set with its controller bindings in one transaction.
     from ...ui.state import live_controls
-    from . import driver_manager, source_binding
 
     props = (
         registered_props if registered_props is not None
         else SimpleNamespace(live_control_bindings="{}")
     )
     bindings = live_controls.read_bindings(props)
-    required = [var["name"] for var in template.get("requires_driver_variables", [])]
     replacements = []
     for target, wrapped_expression in zip(canonical_targets, prepared):
         owner, data_path, index = (
             target["owner"], target["data_path"], int(target["index"])
         )
-        foreign = getattr(
-            driver_manager, "foreign_live_motion_for_channel", lambda *_: None,
-        )(owner, data_path, index)
-        if foreign:
-            entry["targets"] = original_target_records
-            return False, f"An unavailable edition owns {data_path}[{index}]."
         descriptor = serialize_target(owner, data_path, index)
         binding = bindings.get(live_controls._target_key(descriptor))
         fcurve = _find_owner_driver(owner, data_path, index)
@@ -1110,18 +1049,6 @@ def apply_expression_to_entry(
         )
 
         def configure(driver, expression=wrapped_expression):
-            if required:
-                existing = {item.name for item in driver.variables}
-                missing = [name for name in required if name not in existing]
-                if missing or source_entry:
-                    ok, message = source_binding.bind_required_variables(
-                        driver, template, source_entry,
-                    )
-                    if not ok:
-                        raise ValueError(
-                            message or "Add required driver variable(s) first: "
-                            + ", ".join(missing)
-                        )
             if prepare_driver is not None:
                 result = prepare_driver(driver)
                 if isinstance(result, tuple) and not result[0]:
@@ -1247,23 +1174,11 @@ def remove_driver_from_entry(entry, context=None):
     if not resolved:
         return False, reason
 
-    for target in resolved:
-        owner = target["owner"]
-        data_path = target["data_path"]
-        index = int(target["index"])
-        for record in applied_motion.read(owner):
-            if applied_motion.resolve_template(record) is not None:
-                continue
-            if any(path == data_path and (recorded < 0 or index < 0 or recorded == index)
-                   for path, recorded in applied_motion.paths_of(record)):
-                return False, "Selected motion is not available in this edition; it was left unchanged."
-
     context = context or bpy.context
     props = getattr(getattr(context, "scene", None), "espresso_props", None)
     captured = capture_cleanup_for_entry(entry, props)
     snapshots = _snapshot_resolved_drivers(resolved)
     removed = 0
-    removed_groups = 0
     try:
         for item in snapshots:
             if not item["existed"]:
@@ -1294,29 +1209,20 @@ def remove_driver_from_entry(entry, context=None):
         except Exception:
             pass
 
-    removed_groups = cleanup_entry_node_groups(entry)
-    helper_count, controller_count = cleanup_captured_resources(
+    controller_count = cleanup_captured_resources(
         captured, getattr(context, "scene", None), props,
     )
 
-    if removed == 0 and removed_groups == 0 and helper_count == 0 and controller_count == 0:
+    if removed == 0 and controller_count == 0:
         return False, "No driver was present on the remembered target."
-    if removed_groups:
-        group_label = (
-            "Espresso node group" if removed_groups == 1
-            else f"{removed_groups} Espresso node groups"
-        )
-        message = f"Removed {group_label} and its connected driver(s)."
-    else:
-        message = "Removed driver from last target." if removed == 1 else f"Removed {removed} target drivers."
-    cleaned = helper_count + controller_count
-    if cleaned:
-        message += f" Cleaned {cleaned} Espresso helper resource{'' if cleaned == 1 else 's'}."
+    message = "Removed driver from last target." if removed == 1 else f"Removed {removed} target drivers."
+    if controller_count:
+        message += f" Cleaned {controller_count} Live control{'' if controller_count == 1 else 's'}."
     return True, message
 
 
 def convert_motion_entry_to_single(
-    entry, target_index, expression, template, *, source_entry=None, scene=None,
+    entry, target_index, expression, template, *, scene=None,
     rest_start_mode=None, output_baseline=None, validation_template=None,
     clear_other_channels=True,
 ):
@@ -1335,13 +1241,12 @@ def convert_motion_entry_to_single(
     converted = copy.deepcopy(entry)
     converted["targets"] = [copy.deepcopy(entry["targets"][int(target_index)])]
     converted["application_scope"] = "SINGLE"
-    converted["application_mode"] = "SINGLE"
     converted["template_id"] = str((template or {}).get("id") or "")
     converted["template_name"] = str((template or {}).get("name") or "")
     converted["apply_kind"] = "template"
 
     ok, message = apply_expression_to_entry(
-        converted, expression, template, source_entry=source_entry, scene=scene,
+        converted, expression, template, scene=scene,
         rest_start_mode=rest_start_mode, output_baseline=output_baseline,
         validation_template=validation_template,
     )

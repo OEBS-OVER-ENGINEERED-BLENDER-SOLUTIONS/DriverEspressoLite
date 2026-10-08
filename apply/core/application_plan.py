@@ -1,4 +1,4 @@
-"""Typed, mutation-free plans for source-aware Driver Espresso application."""
+"""Typed, mutation-free plans for applying a recipe to remembered targets."""
 
 from __future__ import annotations
 
@@ -39,8 +39,6 @@ class ApplicationPlan:
     scope: str
     origin: str
     targets: Tuple[TargetClaim, ...]
-    source: Mapping[str, object] = field(default_factory=dict)
-    source_required: bool = False
     schema_version: int = SCHEMA_VERSION
 
 
@@ -59,11 +57,10 @@ def infer_scope(entry, template=None):
     explicit = str((entry or {}).get("application_scope") or "").upper()
     if explicit in SCOPES:
         return explicit
-    mode = str((entry or {}).get("application_mode") or "").upper()
-    if mode == "MOTION" or (template or {}).get("channels"):
+    if (template or {}).get("channels"):
         return MOTION_SET
     origin = str((entry or {}).get("apply_kind") or "").lower()
-    if origin in {"motion", "camera", "role_set"}:
+    if origin == "motion":
         return MOTION_SET
     targets = tuple((entry or {}).get("targets") or ())
     return BROADCAST if len(targets) > 1 else SINGLE
@@ -89,10 +86,9 @@ def scope_transition(stored_scope, requested_scope):
     return SAME_SCOPE
 
 
-def preflight_transition(plan, template, *, source_status=None, confirmed=False,
-                         has_object_target=False):
+def preflight_transition(plan, template, *, confirmed=False, has_object_target=False):
     """Validate a Last Target conversion without touching any target driver."""
-    base = preflight(plan, source_status=source_status)
+    base = preflight(plan)
     errors = list(base.errors)
     warnings = list(base.warnings)
     requested = template_scope(template, target_count=len(plan.targets))
@@ -124,8 +120,6 @@ def from_entry(entry, template=None):
         infer_scope(data, template),
         str(data.get("apply_kind") or "template"),
         targets,
-        dict(data.get("source_entry") or {}),
-        bool(data.get("source_required", False)),
         int(data.get("application_schema", SCHEMA_VERSION)),
     )
 
@@ -134,12 +128,10 @@ def entry_metadata(plan):
     return {
         "application_schema": SCHEMA_VERSION,
         "application_scope": plan.scope,
-        "source_required": bool(plan.source_required),
-        "source_entry": dict(plan.source),
     }
 
 
-def preflight(plan, *, source_status=None):
+def preflight(plan):
     errors = []
     if plan.scope not in SCOPES:
         errors.append("Unknown application scope: %s." % plan.scope)
@@ -150,8 +142,4 @@ def preflight(plan, *, source_status=None):
         errors.append("The application plan contains duplicate target channels.")
     if any(not item.data_path for item in plan.targets):
         errors.append("One application target has no property path.")
-    if plan.source_required:
-        status = dict(source_status or {})
-        if status.get("code") != "ACTIVE":
-            errors.append(status.get("reason") or "Choose a valid Espresso Input source.")
     return PreflightReport(tuple(errors))

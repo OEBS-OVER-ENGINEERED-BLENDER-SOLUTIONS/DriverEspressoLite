@@ -22,13 +22,4 @@ TAGLINE = "A starter set of native Blender driver recipes"
 EXTENSION_ID = "driver_espresso_lite"
 
 
-#: Whether this build draws the illustrated Visual Preview: pictures that
-#: perform the motion rather than chart it. The graph preview, which reports
-#: what the driver actually does, is always available.
-HAS_VISUAL_PREVIEW = False
-
-#: Whether this build offers the Favorites & Recent section. Read from this
-#: flag rather than by comparing EXTENSION_ID, so identity lives in one file.
-HAS_FAVORITES = False
-
-__all__ = ("EXTENSION_ID", "HAS_FAVORITES", "NAME", "TAGLINE")
+__all__ = ("EXTENSION_ID", "NAME", "TAGLINE")

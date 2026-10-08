@@ -15,20 +15,9 @@ _MODULES = {
     "source_binding": ".core.source_binding",
     "target_memory": ".core.target_memory",
     "application_plan": ".core.application_plan",
-    "input_presentation": ".core.input_presentation",
     "applied_motion": ".motion.applied_motion",
     "applied_motion_manager": ".motion.applied_motion_manager",
-    "camera_application": ".motion.camera_application",
     "motion_channels": ".motion.motion_channels",
-    "pose_capture": ".motion.pose_capture",
-    "internal_helpers": ".setups.internal_helpers",
-    "response_rig": ".setups.response_rig",
-    "workflow_setups": ".setups.workflow_setups",
-    "layout_preparation": ".setups.layout_preparation",
-    "colour_ramp": ".spatial.colour_ramp",
-    "light_layout": ".spatial.light_layout",
-    "shared_material_sweep": ".spatial.shared_material_sweep",
-    "spatial_fields": ".spatial.spatial_fields",
 }
 
 __all__ = tuple(_MODULES)

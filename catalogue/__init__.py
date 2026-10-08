@@ -12,12 +12,9 @@ from importlib import import_module
 _MODULES = {
     "browse_groups": ".core.browse_groups",
     "catalogue_contracts": ".core.catalogue_contracts",
-    "effect_ids": ".core.effect_ids",
     "taxonomy": ".core.taxonomy",
     "templates": ".core.templates",
     "use_cases": ".core.use_cases",
-    "palettes": ".presets.palettes",
-    "preset_blocks": ".presets.preset_blocks",
 }
 
 __all__ = tuple(_MODULES)

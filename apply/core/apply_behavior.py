@@ -41,12 +41,9 @@ def capture_target_rest_state(
     target, expression, template, scene, mode, output_baseline=None,
     additive_profile=None, snapshot_frame=None,
 ):
-    """Capture the rest state, optionally AT A GIVEN FRAME.
-
-    ``snapshot_frame`` exists so a re-apply can sample where the driver was
-    originally applied rather than wherever the playhead happens to sit. Without
-    it, Update Last Target silently produced a different result depending on the
-    current frame, and the artist had to remember to scrub back first.
+    """Capture the rest state, optionally at a given frame. ``snapshot_frame`` lets a
+    re-apply sample where the driver was originally applied instead of at the current
+    playhead, so Update Last Target gives the same result at any frame.
     """
     rest_value = read_target_current_value(target.owner, target.data_path, target.index)
     return utils.capture_rest_start_state(
@@ -68,14 +65,12 @@ def capture_target_rest_state(
 def _clamp_range(template, scene, mode):
     """The artist's Min/Max limits, or None when the clamp does not apply.
 
-    Every rest-state caller funnels through capture_target_rest_state, so
-    resolving it once here keeps the toggle out of four separate call sites.
-
-    The has_ordered_output_range test is repeated from the panel deliberately:
-    the toggle is hidden for templates that carry their own Minimum/Maximum,
-    but the flag is a scene property and survives switching to one of them. Read
-    only in the panel, a stale True would silently clamp a template whose own
-    range was already the answer.
+    Every rest-state caller funnels through capture_target_rest_state, so resolving it
+    once here keeps the toggle out of four separate call sites. The
+    has_ordered_output_range test is repeated from the panel on purpose: the toggle is
+    hidden for templates that carry their own Minimum/Maximum, but the flag is a scene
+    property and survives switching to one of them, so a stale True must not clamp a
+    template whose own range is already the answer.
     """
     if mode != utils.REST_START_ADDITIVE:
         return None
@@ -85,11 +80,9 @@ def _clamp_range(template, scene, mode):
     from ...catalogue import catalogue_contracts
 
     if catalogue_contracts.has_ordered_output_range(template):
-        # Nothing to add: the template's own Minimum/Maximum already bound it.
-        # Measured across the whole catalogue, no template that declares a range
-        # exceeds it, so a clamp here would never fire. If one ever does, that
-        # is a bug in that template's kernel - the same class as a percussive kernel
-        # - and belongs fixed in the catalogue, not hidden behind a toggle.
+        # Nothing to add: the template's own Minimum/Maximum already bound the value, so
+        # a clamp here would never fire. A kernel that exceeds its declared range should
+        # be fixed in the catalogue, not hidden behind a toggle.
         return None
     # No declared range, so the artist supplies one - the Kick Drum case.
     return (float(props.clamp_min), float(props.clamp_max))

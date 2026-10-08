@@ -16,16 +16,6 @@ class _ValueEnum(str, Enum):
 class BlendMode(_ValueEnum):
     REPLACE = "REPLACE"
     ADD = "ADD"
-    MULTIPLY = "MULTIPLY"
-    MAX = "MAX"
-    MIN = "MIN"
-
-
-class BaselineContract(_ValueEnum):
-    ZERO = "ZERO"
-    ONE = "ONE"
-    CAPTURED = "CAPTURED"
-    TEMPLATE = "TEMPLATE"
 
 
 @dataclass(frozen=True)
@@ -36,12 +26,9 @@ class StackLayer:
     channel: str
     expression: str
     blend: BlendMode = BlendMode.ADD
-    baseline: BaselineContract = BaselineContract.ZERO
     weight: float = 1.0
     muted: bool = False
     solo: bool = False
-    mask: Tuple[str, ...] = ()
-    route_hint: str = "AUTO"
     variables: Tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self):
@@ -53,9 +40,7 @@ class StackLayer:
         if not math.isfinite(weight) or weight < 0.0:
             raise ValueError("Stack layer weight must be finite and non-negative.")
         object.__setattr__(self, "blend", BlendMode(self.blend))
-        object.__setattr__(self, "baseline", BaselineContract(self.baseline))
         object.__setattr__(self, "weight", weight)
-        object.__setattr__(self, "mask", tuple(str(value) for value in self.mask))
         object.__setattr__(self, "variables", tuple(dict(value) for value in self.variables))
 
     def to_dict(self):
@@ -63,19 +48,16 @@ class StackLayer:
             "layer_id": self.layer_id, "effect_id": self.effect_id,
             "label": self.label, "channel": self.channel,
             "expression": self.expression, "blend": self.blend.value,
-            "baseline": self.baseline.value, "weight": self.weight,
-            "muted": self.muted, "solo": self.solo,
-            "mask": list(self.mask), "route_hint": self.route_hint,
+            "weight": self.weight, "muted": self.muted, "solo": self.solo,
             "variables": [dict(value) for value in self.variables],
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]):
-        return cls(**dict(
-            value,
-            mask=tuple(value.get("mask", ())),
-            variables=tuple(value.get("variables", ())),
-        ))
+        # Records saved by earlier builds carry a few extra keys; read what is used.
+        known = {name: value[name] for name in cls.__dataclass_fields__ if name in value}
+        known["variables"] = tuple(value.get("variables", ()))
+        return cls(**known)
 
 
 @dataclass(frozen=True)
@@ -111,10 +93,6 @@ def validate_stack(motion: MotionStack) -> None:
         if layer.layer_id in seen:
             raise ValueError("Motion Stack layer IDs must be unique.")
         seen.add(layer.layer_id)
-        if layer.channel.startswith("rotation") and layer.blend in {BlendMode.MAX, BlendMode.MIN}:
-            raise ValueError("Rotation channels do not support MAX or MIN blending.")
-        if layer.channel.startswith("scale") and layer.blend is BlendMode.ADD:
-            raise ValueError("Scale layers must use MULTIPLY or REPLACE composition.")
 
 
 def resolve_active_layers(motion: MotionStack) -> Tuple[StackLayer, ...]:

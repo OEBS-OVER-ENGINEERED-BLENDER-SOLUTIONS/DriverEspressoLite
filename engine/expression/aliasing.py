@@ -1,32 +1,19 @@
 """Telling the artist when Speed has gone past what frames can show.
 
-Past that point a recipe reads as going SLOWER when its Speed is raised. The
-motion is not slower: it is faster than the frame rate can represent, so what
-stays visible is the small leftover.
+Past that point a recipe reads as going slower when its Speed is raised. The motion is
+faster than the frame rate can represent, so what stays visible is the small leftover.
+At 20 frames, Speed 1.0 turns 0.05 per frame as seen; Speed 10.0 is 0.5 per frame but is
+seen as -0.5 (backwards); Speed 20.0 is 1.0 but is seen as 0 (frozen); and Speed 100.7
+is seen as 0.034 (slower than Speed 1).
 
-Measured, at Frames 20:
+Half a cycle per frame is the ceiling. Past it the sampled result folds back: it
+reverses, then stands still, then creeps forward again (the wagon-wheel effect). Nothing
+is broken, but the slider stops meaning what it says, and the line moves with the cycle
+length. This computes the line and the panel states it. It does not clamp, because a
+deliberate strobe is legitimate.
 
-    Speed    true turns/frame    apparent turns/frame
-      1.0               0.050                   0.050
-      5.0               0.250                   0.250
-     10.0               0.500                  -0.500   (backwards)
-     20.0               1.000                   0.000   (frozen)
-    100.7               5.034                   0.034   (slower than Speed 1)
-
-Half a cycle per frame is the ceiling. Past it the sampled result folds back:
-first it reverses, then it stands still, then it creeps forward again - the
-wagon-wheel effect. Nothing is broken; the slider simply stops meaning what it
-says, and the artist has no way to know where that line is because it moves
-with the cycle length.
-
-So this computes the line and the panel states it. It does NOT clamp: a
-deliberate strobe is a legitimate thing to want, and hiding the range would be
-nannying. It says what will happen and leaves the decision alone.
-
-Scoped deliberately. PROJECT_MANUAL: "Do not apply an analysis framework
-outside its domain. Nyquist limits describe smooth oscillators, not intentional
-pseudo-random gates or impulses." A twinkle re-rolling a hash every few frames
-is not a wave being undersampled, so it is excluded rather than warned about.
+Scope: this describes smooth oscillators. A twinkle that re-rolls a hash every few
+frames is not a wave being undersampled, so it is excluded.
 """
 
 from __future__ import annotations

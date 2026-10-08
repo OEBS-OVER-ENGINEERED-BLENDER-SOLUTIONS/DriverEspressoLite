@@ -113,17 +113,6 @@ def is_hovered(context):
             and (area is None or _hover[1] == area.as_pointer()))
 
 
-def context_owner(context):
-    """Detached window/editor identity for an asynchronous preview request."""
-    window, area = getattr(context, 'window', None), getattr(context, 'area', None)
-    return (window.as_pointer() if window else 0, area.as_pointer() if area else 0)
-
-
-def is_owner_hovered(owner):
-    """Do not transfer an old request to another sidebar merely on hover."""
-    return bpy.app.background or (_enabled and _hover == owner)
-
-
 def frame(context):
     """Freeze preview time outside the sidebar; leave scene time untouched."""
     scene = context.scene

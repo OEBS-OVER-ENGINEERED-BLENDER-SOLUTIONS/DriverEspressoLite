@@ -11,13 +11,11 @@ from ...apply.motion import stack_records, stack_runtime
 from ...apply.setups import (
     parameter_bindings,
 )
-from ...apply.setups import layout_preparation
 from ...catalogue import templates
-from ...engine import utils
 from ...engine.motion_stack.stack import MotionStack, StackLayer
 from ..state import props as espresso_props
 from . import bake_applied
-from .operators import BakeOptionsMixin, apply_expression_to_driver, missing_required_variables
+from .operators import BakeOptionsMixin, apply_expression_to_driver
 
 
 def _selected_descriptors(context):
@@ -140,20 +138,6 @@ def _restore_driver_snapshots(snapshots):
     return tuple(item.get("restore_error") for item in snapshots if item.get("restore_error"))
 
 
-def _preflight_structural_effects(structural_effects):
-    for effect in structural_effects:
-        host = effect.get("host")
-        if host is None:
-            return False
-        carriers = (
-            [host] if layout_preparation.is_carrier(host)
-            else layout_preparation.carriers_for_source(host)
-        )
-        if not carriers:
-            return False
-    return True
-
-
 def _preflight_recorded_effects(recorded_effects):
     for effect in recorded_effects:
         host = effect.get("host")
@@ -172,27 +156,8 @@ def remove_selected_with_rollback(context, descriptors, effect_tokens, props):
     """Preflight and remove mixed selections with rollback on failure."""
     from ...generated.core.transaction import GeneratedTransaction
 
-    # A checked row that belongs to a rig with its own teardown IS the rig:
-    # there is no such thing as an authoring rig minus its mount driver. The row
-    # escalates to its effect and the route's clear runs for it.
     effect_tokens = list(effect_tokens)
-    plain = []
-    for descriptor in descriptors:
-        metadata = driver_manager.metadata_for_descriptor(descriptor)
-        if metadata is not None and applied_motion.resolve_template(
-            metadata["record"],
-        ) is None:
-            return False, "Selected motion is not available in this edition; it was left unchanged.", {}
-        route = (
-            bake_applied.route_for_record(metadata["host"], metadata["record"])
-            if metadata else None
-        )
-        if route is not None:
-            if metadata["record_token"] not in effect_tokens:
-                effect_tokens.append(metadata["record_token"])
-            continue
-        plain.append(descriptor)
-    descriptors = _dedupe_descriptors_for_effects(plain, effect_tokens)
+    descriptors = _dedupe_descriptors_for_effects(list(descriptors), effect_tokens)
     fcurves = []
     for descriptor in descriptors:
         fcurve = driver_targets.resolve_driver(descriptor)
@@ -207,38 +172,8 @@ def remove_selected_with_rollback(context, descriptors, effect_tokens, props):
     ]
     if any(effect is None for effect in effects):
         return False, "A checked applied effect no longer exists; nothing was removed.", {}
-    if any(applied_motion.resolve_template(effect["record"]) is None
-           for effect in effects if effect.get("record")):
-        return False, "Selected motion is not available in this edition; it was left unchanged.", {}
 
-    # STRUCTURAL_EFFECT alone is no longer enough to mean "prepared layout".
-    # An authoring rig is filed as a structure too -- correctly, it is the thing
-    # its flight attaches to -- and this branch hands every structural effect
-    # to layout_preparation.clear(), which knows nothing about an authoring rig and
-    # answered "A checked Prepared Layout could not be removed."
-    #
-    # The honest test is the one this branch actually depends on: it clears
-    # layout CARRIERS, so it may only claim hosts that are carriers. Anything
-    # else structural falls through to clear_records, which is the path that
-    # tore an authoring rig down correctly before it was reclassified.
-    structural_effects = [
-        effect for effect in effects
-        if effect["effect_kind"] == applied_motion_manager.STRUCTURAL_EFFECT
-        and effect.get("host") is not None
-        and layout_preparation.is_carrier(effect["host"])
-    ]
-    recorded_effects = [
-        effect for effect in effects if effect not in structural_effects
-    ]
-    structural_hosts = {
-        effect["host"] for effect in structural_effects if effect.get("host") is not None
-    }
-    recorded_effects = [
-        effect for effect in recorded_effects
-        if effect.get("host") not in structural_hosts
-    ]
-    if not _preflight_structural_effects(structural_effects):
-        return False, "A checked Prepared Layout could not be removed.", {}
+    recorded_effects = effects
     if not _preflight_recorded_effects(recorded_effects):
         return False, "A checked applied effect could not be removed.", {}
 
@@ -253,14 +188,6 @@ def remove_selected_with_rollback(context, descriptors, effect_tokens, props):
         if owner is not None:
             extra_owners.append(owner)
     chosen = [(effect["host"], effect["record"]) for effect in recorded_effects]
-    for effect in structural_effects:
-        host = effect["host"]
-        carriers = (
-            [host] if layout_preparation.is_carrier(host)
-            else layout_preparation.carriers_for_source(host)
-        )
-        for carrier in carriers:
-            chosen.append((carrier, effect.get("record") or {}))
     _snapshot_hosts, snapshot = bake_applied.capture_clear_snapshot(
         chosen, extra_fcurve_owners=extra_owners,
     )
@@ -274,16 +201,6 @@ def remove_selected_with_rollback(context, descriptors, effect_tokens, props):
             )
             transaction.on_rollback(snapshot.restore)
             transaction.on_rollback(lambda: _restore_driver_snapshots(driver_snapshots))
-            for effect in structural_effects:
-                host = effect["host"]
-                try:
-                    alive = host is not None and target_memory.host_is_alive(host)
-                except (ReferenceError, AttributeError):
-                    alive = False
-                if not alive:
-                    raise RuntimeError("A checked Prepared Layout could not be removed.")
-                if layout_preparation.clear(host) <= 0:
-                    raise RuntimeError("A checked Prepared Layout could not be removed.")
             if recorded_effects:
                 ok, message = bake_applied.clear_records(
                     context,
@@ -307,7 +224,6 @@ def remove_selected_with_rollback(context, descriptors, effect_tokens, props):
                 owner.driver_remove(curve.data_path, curve.array_index)
                 removed_drivers += 1
             target_memory.cleanup_captured_resources(captured, context.scene, props)
-            target_memory.cleanup_entry_node_groups({"targets": captured.get("targets", [])})
             # A record emptied a row at a time is purged with its dependencies,
             # exactly as if its effect had been checked.
             purged_effects = 0
@@ -344,14 +260,6 @@ def prepare_effect_settings(context, effect):
         return binding, template, {}, binding.reason or "This applied effect is read-only."
     values = parameter_bindings.read_values(binding)
     return binding, template, values, ""
-
-
-def load_effect_settings(context, effect):
-    """Compatibility helper; settings now open in their own editor."""
-    binding, template, values, message = prepare_effect_settings(context, effect)
-    return bool(binding and template and values), message or (
-        "Settings are ready for %s." % (effect.get("label") or "the applied effect")
-    )
 
 
 def _applied_effect_identity(effect):
@@ -408,35 +316,27 @@ def _selected_batch_identities(props):
 
 
 def action_label(effect_kind, action):
-    noun = "Effect" if effect_kind == applied_motion_manager.STRUCTURAL_EFFECT else "Motion"
     return {
-        "SETTINGS": "%s Settings" % noun,
-        "BAKE": "Bake %s" % noun,
-        "CLEAR": "Remove Applied %s" % noun,
-    }.get(action, "Manage Applied %s" % noun)
+        "SETTINGS": "Motion Settings",
+        "BAKE": "Bake Motion",
+        "CLEAR": "Remove Applied Motion",
+    }.get(action, "Manage Applied Motion")
 
 
 def _populate_parameter_items(collection, binding, template, values):
     collection.clear()
-    visible = parameter_bindings.visible_tokens(binding, template, values)
     for spec in template.get("params", ()):
-        if spec.get("token") not in visible:
-            continue
         popup = collection.add()
         popup.token = spec["token"]
         popup.label = spec.get("label", popup.token)
         popup.value_type = spec.get("type", "FLOAT")
         popup.unit = spec.get("unit", "")
         value = values.get(popup.token, spec.get("default", 0))
-        if popup.value_type == "BOOL":
-            popup.bool_value = bool(value)
-        elif popup.value_type == "INT":
+        if popup.value_type == "INT":
             popup.int_value = int(round(value))
         elif popup.value_type == "COLOR":
             rgba = tuple(value)
             popup.color_value = rgba if len(rgba) == 4 else (*rgba[:3], 1.0)
-        elif popup.value_type in {"STRING", "ENUM"}:
-            popup.string_value = str(value)
         else:
             popup.float_value = float(value)
 
@@ -444,14 +344,10 @@ def _populate_parameter_items(collection, binding, template, values):
 def _parameter_values(items):
     values = {}
     for item in items:
-        if item.value_type == "BOOL":
-            value = bool(item.bool_value)
-        elif item.value_type == "INT":
+        if item.value_type == "INT":
             value = int(item.int_value)
         elif item.value_type == "COLOR":
             value = tuple(item.color_value)
-        elif item.value_type in {"STRING", "ENUM"}:
-            value = str(item.string_value)
         else:
             value = float(item.float_value)
         values[item.token] = value
@@ -466,10 +362,8 @@ def _snapshot_pinned_effect_settings(props):
             "label": item.label,
             "value_type": item.value_type,
             "unit": item.unit,
-            "bool_value": bool(item.bool_value),
             "int_value": int(item.int_value),
             "float_value": float(item.float_value),
-            "string_value": str(item.string_value),
             "color_value": tuple(item.color_value),
         })
     return {
@@ -498,10 +392,8 @@ def _restore_pinned_effect_settings(props, snapshot):
             item.label = record.get("label") or ""
             item.value_type = record.get("value_type") or "FLOAT"
             item.unit = record.get("unit") or ""
-            item.bool_value = bool(record.get("bool_value"))
             item.int_value = int(record.get("int_value") or 0)
             item.float_value = float(record.get("float_value") or 0.0)
-            item.string_value = str(record.get("string_value") or "")
             color = record.get("color_value") or (1.0, 1.0, 1.0, 1.0)
             try:
                 item.color_value = color
@@ -517,15 +409,11 @@ def apply_preset_to_parameter_items(items, preset_values):
         item = by_token.get(token)
         if item is None:
             continue
-        if item.value_type == "BOOL":
-            item.bool_value = bool(value)
-        elif item.value_type == "INT":
+        if item.value_type == "INT":
             item.int_value = int(round(value))
         elif item.value_type == "COLOR":
             rgba = tuple(value)
             item.color_value = rgba if len(rgba) == 4 else (*rgba[:3], 1.0)
-        elif item.value_type in {"STRING", "ENUM"}:
-            item.string_value = str(value)
         else:
             item.float_value = float(value)
 
@@ -668,18 +556,6 @@ class ESPRESSO_OT_refresh_pinned_effect_settings(bpy.types.Operator):
             self.report({"WARNING"}, "The pinned applied effect no longer resolves.")
             return {"CANCELLED"}
         ok, message = populate_pinned_effect_settings(context, effect)
-        self.report({"INFO" if ok else "WARNING"}, message)
-        return {"FINISHED" if ok else "CANCELLED"}
-
-
-class ESPRESSO_OT_update_pinned_effect_settings(bpy.types.Operator):
-    bl_idname = "espresso.update_pinned_effect_settings"
-    bl_label = "Update Applied Effect"
-    bl_description = "Write these values to the pinned applied effect"
-    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
-
-    def execute(self, context):
-        ok, message = sync_pinned_effect_settings(context)
         self.report({"INFO" if ok else "WARNING"}, message)
         return {"FINISHED" if ok else "CANCELLED"}
 
@@ -885,9 +761,6 @@ class ESPRESSO_OT_apply_selected_driver_targets(bpy.types.Operator):
             if fcurve is None:
                 self.report({"WARNING"}, "A checked driver no longer exists; nothing was changed.")
                 return {"CANCELLED"}
-            if missing_required_variables(fcurve.driver, template):
-                self.report({"WARNING"}, "A checked driver is missing variables required by this template.")
-                return {"CANCELLED"}
             fcurves.append(fcurve)
 
         original = [(curve.driver, curve.driver.expression) for curve in fcurves]
@@ -895,7 +768,7 @@ class ESPRESSO_OT_apply_selected_driver_targets(bpy.types.Operator):
         try:
             for fcurve in fcurves:
                 ok, message = apply_expression_to_driver(
-                    fcurve.driver, props.preview, template, None,
+                    fcurve.driver, props.preview, template,
                 )
                 if not ok:
                     raise RuntimeError(message)
@@ -936,8 +809,6 @@ class ESPRESSO_OT_remove_selected_driver_targets(bpy.types.Operator):
         return bool(_selected_descriptors(context) or _selected_effect_tokens(context))
 
     def execute(self, context):
-        from ..views import guided_apply
-        guided_apply.clear_preflight_cache()
         props = context.scene.espresso_props
         descriptors = _selected_descriptors(context)
         effect_tokens = _selected_effect_tokens(context)
@@ -1001,8 +872,6 @@ class ESPRESSO_OT_edit_driver_target(bpy.types.Operator):
         if not metadata or template is None:
             self.report({"WARNING"}, "The applied settings record is no longer available.")
             return {"CANCELLED"}
-        stored_mode = str(metadata["entry"].get("application_mode") or "SINGLE")
-        template = templates.resolve_application_mode(template, stored_mode)
         binding = parameter_bindings.binding_for_entry(
             context, template, metadata["entry"], label=metadata["label"],
         )
@@ -1044,9 +913,6 @@ class ESPRESSO_OT_edit_driver_target(bpy.types.Operator):
         if not resolved:
             self.report({"WARNING"}, reason or "The applied targets are no longer available.")
             return {"CANCELLED"}
-        template = templates.resolve_application_mode(
-            template, str(entry.get("application_mode") or "SINGLE"),
-        )
         binding = parameter_bindings.binding_for_entry(
             context, template, entry, label=metadata["label"],
         )
@@ -1137,8 +1003,6 @@ class ESPRESSO_OT_manage_applied_effect(BakeOptionsMixin, bpy.types.Operator):
             )
 
     def execute(self, context):
-        from ..views import guided_apply
-        guided_apply.clear_preflight_cache()
         props = context.scene.espresso_props
         effect = self._effect(context)
         if effect is None:
@@ -1147,34 +1011,6 @@ class ESPRESSO_OT_manage_applied_effect(BakeOptionsMixin, bpy.types.Operator):
             self.report({"WARNING"}, message)
             return {"CANCELLED"}
         host = effect["host"]
-        if self.action == "BAKE" and not effect.get("bakeable", True):
-            message = "Bake the owning effect to bake this child result."
-            self.report({"WARNING"}, message)
-            return {"CANCELLED"}
-        if self.action == "CLEAR" and not effect.get("removable", True):
-            message = "Remove or replace the owning effect to remove this child."
-            self.report({"WARNING"}, message)
-            return {"CANCELLED"}
-        if (
-            effect.get("child_effect_kind") == "SPATIAL_EFFECTOR"
-            and self.action != "SETTINGS"
-        ):
-            if self.action == "BAKE":
-                message = "Bake the owning motion to bake this Effector's composed result."
-                self.report({"WARNING"}, message)
-                return {"CANCELLED"}
-            removed = None
-            ok = removed > 0
-            message = (
-                "Removed the Effector."
-                if ok else "The Effector no longer resolves."
-            )
-            _record_manage_status(props, effect, message)
-            self.report({"INFO" if ok else "WARNING"}, message)
-            if ok:
-                clear_pinned_effect_settings(props, self.record_token)
-            props.driver_target_items_signature = ""
-            return {"FINISHED" if ok else "CANCELLED"}
         if self.action == "SETTINGS":
             binding, template, _values, message = prepare_effect_settings(context, effect)
             if binding is None or template is None:
@@ -1193,20 +1029,6 @@ class ESPRESSO_OT_manage_applied_effect(BakeOptionsMixin, bpy.types.Operator):
                 )
             props.driver_target_items_signature = ""
             self.report({"INFO" if ok else "WARNING"}, message)
-            return {"FINISHED" if ok else "CANCELLED"}
-
-        if effect.get("effect_kind") == applied_motion_manager.STRUCTURAL_EFFECT:
-            if self.action == "BAKE":
-                ok, message, _objects = layout_preparation.bake(context, host)
-            else:
-                ok, message = bake_applied.clear_records(
-                    context, [(host, effect["record"])],
-                )
-            _record_manage_status(props, effect, message)
-            self.report({"INFO" if ok else "WARNING"}, message)
-            if ok and self.action == "CLEAR":
-                clear_pinned_effect_settings(props, self.record_token)
-            props.driver_target_items_signature = ""
             return {"FINISHED" if ok else "CANCELLED"}
 
         stack_payload = stack_records.stack_from_extras(
@@ -1460,7 +1282,6 @@ CLASSES = (
     ESPRESSO_OT_edit_driver_target,
     ESPRESSO_OT_toggle_applied_effect_settings_pin,
     ESPRESSO_OT_refresh_pinned_effect_settings,
-    ESPRESSO_OT_update_pinned_effect_settings,
     ESPRESSO_OT_set_applied_settings_preset,
     ESPRESSO_OT_manage_applied_effect,
 )

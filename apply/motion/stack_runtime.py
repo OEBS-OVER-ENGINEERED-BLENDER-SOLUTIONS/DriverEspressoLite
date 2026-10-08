@@ -13,7 +13,7 @@ from ...generated import animation as generated_animation
 from ...generated import helpers as generated_helpers
 from ...generated import properties as generated_properties
 from . import applied_motion, stack_records
-from ..core import target_memory
+from ..core import source_binding, target_memory
 
 
 STACK_EFFECT_PREFIX = "STK"
@@ -48,6 +48,17 @@ def _copy_driver_state(curve):
             })
         variables.append((variable.name, variable.type, targets))
     return driver.type, driver.expression, variables
+
+
+def _set_target_id(target, id_block):
+    """Point a driver-variable target at a datablock, whatever kind it is.
+
+    The target's own ID-type switch has to match before Blender accepts the
+    datablock: a light's data cannot go into a target still set to Object.
+    """
+    if id_block is not None:
+        target.id_type = source_binding.driver_id_type(id_block)
+    target.id = id_block
 
 
 def serialize_driver_variables(driver):
@@ -85,7 +96,7 @@ def _restore_serialized_variables(driver, bindings):
                 raise ValueError(
                     "Motion Stack variable source no longer resolves: %s" % values["id_name"]
                 )
-            target.id = id_block
+            _set_target_id(target, id_block)
             for key in ("data_path", "transform_type", "transform_space", "bone_target"):
                 value = values.get(key)
                 if value:
@@ -103,7 +114,7 @@ def _restore_driver(owner, data_path, index, state):
         variable.name = name
         variable.type = variable_type
         for target, values in zip(variable.targets, targets):
-            target.id = values["id"]
+            _set_target_id(target, values["id"])
             target.data_path = values["data_path"]
             target.transform_type = values["transform_type"]
             target.transform_space = values["transform_space"]
@@ -258,14 +269,30 @@ def clear(owner, stack_id):
     removed = 0
     for data_path, index in applied_motion.paths_of(record):
         removed += int(owner.driver_remove(data_path, index))
-    old_keys = tuple(record.get("extras", {}).get("helper_keys", ()))
-    removed += _remove_helper_object(
-        record.get("extras", {}).get("helper_object_name", ""),
-    )
-    removed += sum(1 for key in old_keys if key in owner)
-    _remove_owner_helper_keys(owner, old_keys)
+    removed += discard_resources(owner, record)
     applied_motion.forget(owner, code)
     return removed
+
+
+def discard_resources(owner, record):
+    """Delete the helper object and helper properties one stack record owns.
+
+    Shared by Remove and by every other teardown (bake, Organize row removal,
+    the stale-record cleanup), so a stack never leaves its helper behind.
+    Returns how many pieces were removed.
+    """
+    extras = (record or {}).get("extras") or {}
+    keys = tuple(extras.get("helper_keys", ()))
+    removed = _remove_helper_object(extras.get("helper_object_name", ""))
+    removed += sum(1 for key in keys if key in owner)
+    _remove_owner_helper_keys(owner, keys)
+    return removed
+
+
+def helper_object_of(record):
+    """The helper object a stack record built, or None."""
+    name = str(((record or {}).get("extras") or {}).get("helper_object_name") or "")
+    return bpy.data.objects.get(name) if name else None
 
 
 def _action_fcurves(action):

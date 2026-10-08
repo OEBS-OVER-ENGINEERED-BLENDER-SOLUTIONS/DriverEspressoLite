@@ -1,40 +1,36 @@
-"""A stamp whose driver was deleted by other means becomes invalid -- and goes.
+"""A stamp whose driver was deleted by other means becomes invalid, and is removed.
 
-A record says WHAT was applied; the driver is the authority on whether it
-still EXISTS. Nothing stops an artist deleting a driver by hand -- Blender's
-own Delete Driver, Clear Drivers, or a script -- and when they do, the stamp
-is left behind describing motion that is no longer there. Every read that
-validates already ignores it; the reads that must not -- Clear has to see
-leftovers -- would otherwise offer a phantom row: a host whose stamp names a
-channel that no longer has a driver.
+A record says what was applied; the driver is the authority on whether it still exists.
+An artist can delete a driver by hand (Delete Driver, Clear Drivers, a script), leaving
+a stamp that describes motion no longer there. Reads that validate already ignore it,
+but reads that must not (Clear has to see leftovers) would otherwise offer a phantom
+row.
 
-Blender raises no "driver removed" event. What it does do is update the ID
-the driver lived on, so ``depsgraph_update_post`` sees it -- and only it, in
-``depsgraph.updates``. That is a dictionary-key check per updated ID, never a
-scene-wide walk. A file may already hold leftovers that no update will flag,
-so a load queues every stamped host once.
+Blender raises no "driver removed" event, but it does update the ID the driver lived on,
+so ``depsgraph_update_post`` sees that ID in ``depsgraph.updates``: a dictionary-key
+check per updated ID, never a scene-wide walk. A file may already hold leftovers that no
+update will flag, so loading a file queues every stamped host once.
 
-The reconcile itself runs DEFERRED, on idle, through a one-shot timer, never
-inside the depsgraph pass. That is the safety property. The add-on's own
-rebuilds remove and re-add drivers with a ``view_layer.update()`` between,
-and a purge landing in that window would eat a live motion. Idle means the
-rebuild has finished and its stamps are consistent.
+The reconcile runs deferred, on idle, through a one-shot timer, never inside the
+depsgraph pass. The add-on's own rebuilds remove and re-add drivers with a
+``view_layer.update()`` in between, and a purge landing in that window would remove a
+live motion.
 
-Two rules that are easy to get wrong:
+Two rules:
 
-* EXISTENCE, never validity. A driver flagged invalid still exists -- a rig's
-  drivers can read as invalid while the motion is intact -- and purging one
-  would destroy a working record.
-* One dead channel of a multi-channel motion trims that channel; only a
-  record with no live channel left is purged -- and purged with its helpers,
-  through the same teardown a group-level Remove uses, supplied as a hook so
-  this layer never imports the UI.
+* Existence, never validity. A driver flagged invalid still exists (a rig's drivers can
+  read as invalid while the motion is intact), and purging one would destroy a working
+  record.
+* One dead channel of a multi-channel motion trims that channel; only a record with no
+  live channel left is purged, together with its helpers, through the same teardown a
+  group-level Remove uses. That teardown is supplied as a hook so this layer never
+  imports the UI.
 
-The mirror image is a GHOST: a driver with no record describing it, which no
-list can see, edit, bake or remove. A driver carries no mark of ours, so a
-ghost is only ever claimed on the add-on's own evidence -- target memory
-remembers applying to that exact channel, or the driver wears the controller
-layer. Anything else is somebody's hand-made driver and is left alone.
+The mirror image is a ghost: a driver with no record describing it, which no list can
+show, edit, bake or remove. A driver carries no mark of ours, so a ghost is only claimed
+on the add-on's own evidence: target memory remembers applying to that exact channel, or
+the driver wears the controller layer. Any other driver is the artist's own and is left
+alone.
 """
 
 from __future__ import annotations
@@ -51,8 +47,7 @@ _PURGE = None
 #: twice is reconciled once.
 _PENDING = {}
 
-#: How long to wait when a rig is mid-rebuild, before looking again.
-_RETRY_SECONDS = 0.25
+# How long to wait when a rig is mid-rebuild, before looking again.
 
 #: The controller layer's variable prefix. A driver wearing it is ours.
 CONTROLLER_VARIABLE = "espctl_"
@@ -71,9 +66,8 @@ def set_purge_hook(function):
 def record_is_live(host, record):
     """A record with a driver still behind at least one of its paths.
 
-    Path-less records describe setups made of objects and node groups rather
-    than drivers, and are live by definition here -- their own liveness is a
-    manifest question that belongs to the generated layer.
+    A record with no paths has no driver whose absence would mean anything,
+    so it is live by definition here.
     """
     paths = applied_motion.paths_of(record)
     if not paths:
@@ -91,7 +85,7 @@ def _classify(host, records):
     surviving, dead = [], []
     trimmed = 0
     for record in records:
-        if applied_motion.resolve_template(record) is None:
+        if not applied_motion.is_ours(record):
             surviving.append(record)
             continue
         paths = applied_motion.paths_of(record)
@@ -177,12 +171,6 @@ def _remembered_channels(props):
     return out
 
 
-def _wears_controller(fcurve):
-    driver = getattr(fcurve, "driver", None)
-    return any(str(getattr(variable, "name", "")).startswith(CONTROLLER_VARIABLE)
-               for variable in (driver.variables if driver else ()))
-
-
 def _covered(records, data_path, index):
     for record in records:
         for path, recorded in applied_motion.paths_of(record):
@@ -224,7 +212,7 @@ def find_invalid(props, hosts):
         records = applied_motion.read(host)
         # Dead records and dead channels.
         for record in records:
-            if applied_motion.resolve_template(record) is None:
+            if not applied_motion.is_ours(record):
                 continue
             paths = applied_motion.paths_of(record)
             if not paths:
@@ -263,15 +251,11 @@ def find_invalid(props, hosts):
             key = (str(target.get("id_type", "")), str(target.get("id_name", "")),
                    str(target.get("owner_path", "")), str(target.get("data_path", "")),
                    int(target.get("index", -1)))
-            # ONLY target memory proves the driver is ours to delete.
-            #
-            # A controller variable is not proof on its own: attaching a
-            # controller to a driver the artist wrote by hand is supported, and
-            # counting it would classify their driver as an orphan of ours.
-            # Accepting the finding restored their original expression and then
-            # deleted the whole driver. A controller says Espresso TOUCHED this
-            # driver, not that Espresso MADE it, and only the second justifies
-            # removal.
+            # Only target memory proves the driver is ours to delete. A controller
+            # variable is not proof on its own: attaching a controller to a driver the
+            # artist wrote by hand is supported, so counting it would classify their
+            # driver as an orphan of ours. A controller says Espresso touched this
+            # driver, not that Espresso made it, and only the second justifies removal.
             if key not in remembered:
                 continue
             findings.append({
@@ -347,17 +331,6 @@ def _drain():
     return None
 
 
-def flush_pending():
-    """Run the idle pass now. For tests, and for anything that must not wait."""
-    if bpy.app.timers.is_registered(_drain):
-        bpy.app.timers.unregister(_drain)
-    if not _PENDING:
-        return 0
-    count = len(_PENDING)
-    _drain()
-    return count
-
-
 def stamped_hosts_in_file():
     """Every datablock carrying a stamp. Bounded by the file; used once per
     load, never per draw."""
@@ -414,9 +387,8 @@ def _on_load(*_args):
 def register():
     for bucket, function in ((bpy.app.handlers.depsgraph_update_post, _on_depsgraph_update),
                              (bpy.app.handlers.load_post, _on_load)):
-        # By name, not identity: after a reload the old function object is
-        # gone and an identity check would append a second handler beside
-        # its ghost.
+        # Matched by name, not identity: after a reload the old function object is gone,
+        # and an identity check would append a second handler next to the stale one.
         for existing in list(bucket):
             if getattr(existing, "__name__", "") == function.__name__:
                 bucket.remove(existing)
@@ -435,6 +407,6 @@ def unregister():
 
 
 __all__ = ("record_is_live", "reconcile_host", "find_invalid", "remove_ghost",
-           "note_host", "flush_pending", "stamped_hosts_in_file",
+           "note_host", "stamped_hosts_in_file",
            "set_purge_hook", "register", "unregister",
            "DEAD_RECORD", "DEAD_CHANNEL", "GHOST_DRIVER")

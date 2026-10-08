@@ -1,1 +1,1 @@
-"""Generated helper and higher-level workflow setup services."""
+"""Setup and Live parameter routing for applied effects."""

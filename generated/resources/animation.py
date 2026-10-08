@@ -20,40 +20,6 @@ def create_action(name: str, *, resource_id: str, setup_id: str = "",
     )
 
 
-def create_detached_channelbag(action, owner, *, layer_name="Animation"):
-    """Create the Blender 4.4+ layered-Action container for ``owner``.
-
-    Driver Espresso supports Blender 5.x, where F-curves live in a channel bag
-    rather than directly on ``Action.fcurves``.  Keeping the compatibility
-    detail here prevents generated systems from each inventing their own Action
-    setup.
-    """
-    slot = action.slots.new(owner.id_type, owner.name)
-    layer = action.layers.new(layer_name)
-    strip = layer.strips.new(type="KEYFRAME")
-    bag = strip.channelbag(slot, ensure=True)
-    return bag, slot
-
-
-def assign_action(owner, action, slot):
-    """Attach a fully-built layered Action to its owner.
-
-    Builders can populate a detached Action first, then make this single swap.
-    That keeps replacement transactional: a failed build cannot destroy the
-    owner's previous Action.
-    """
-    animation_data = owner.animation_data_create()
-    animation_data.action = action
-    animation_data.action_slot = slot
-
-
-def create_channelbag(action, owner, *, layer_name="Animation"):
-    """Create and immediately attach a Blender 4.4+ channel bag."""
-    bag, slot = create_detached_channelbag(action, owner, layer_name=layer_name)
-    assign_action(owner, action, slot)
-    return bag
-
-
 def action_containers(action):
     """``(container, curve)`` for every F-curve, whichever storage is in use.
 
@@ -84,11 +50,6 @@ def action_containers(action):
     if pairs:
         return pairs
     return [(action, curve) for curve in (getattr(action, "fcurves", ()) or ())]
-
-
-def action_fcurves(action):
-    """Every F-curve in an Action, whichever storage this Blender uses."""
-    return [curve for _container, curve in action_containers(action)]
 
 
 def ensure_fcurve(action, owner, data_path, *, index=0, group_name=""):

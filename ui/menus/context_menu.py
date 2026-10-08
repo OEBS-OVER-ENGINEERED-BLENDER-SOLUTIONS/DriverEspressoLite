@@ -12,20 +12,15 @@ import bpy
 from ...product.identity import NAME as _PRODUCT_NAME
 
 from ...apply import apply_behavior
-from ...apply import internal_helpers, motion_channels
+from ...apply import motion_channels
 from ...engine.targeting.button_targeting import ButtonDriverTarget, expand_multi_targets, multi_target_count
 from ..actions import operators
 from ..state import props as espresso_props
 from ...apply import source_binding
 from ...apply import apply_target
-from ...apply import shared_material_sweep
-from ...apply import light_layout
 from ...apply import target_memory
 from ...apply import application_plan
-from ...apply.core import driver_manager as core_driver_manager
-from ...apply.setups import audio_reactivity
 from ...engine import utils
-from ...generated import helpers as generated_helpers
 from ...catalogue.core.templates import TEMPLATE_BY_ID
 from ...catalogue import templates as template_catalogue
 from . import button_menu_map
@@ -41,35 +36,6 @@ class TargetInspectorInfo:
 
 
 _POPUP_TARGET_CACHE = {}
-
-
-def _required_variable_names(template):
-    return [var["name"] for var in template.get("requires_driver_variables", [])]
-
-
-def _button_flow_block_message(template, scene_props=None, source_entry=None):
-    scene = getattr(scene_props, "id_data", None) if scene_props is not None else None
-    if scene is not None:
-        audio_message = audio_reactivity.application_block_message(template, scene)
-        if audio_message:
-            return audio_message
-    required = _required_variable_names(template)
-    if not required:
-        return ""
-    # Self-position templates read the object the driver lands on, so there is
-    # nothing to choose. The gate lets them through.
-    if not source_binding.needs_input_source(template):
-        return ""
-    source_entry = source_entry if source_entry is not None else (
-        source_binding.latest_source(scene_props) if scene_props is not None else None
-    )
-    if source_entry:
-        status = source_binding.source_status(source_entry)
-        if status["code"] == source_binding.SOURCE_ACTIVE:
-            return ""
-        return status["reason"]
-    names = ", ".join(required)
-    return "Choose an Espresso input source before applying this template: " + names
 
 
 def _button_array_index(context):
@@ -216,8 +182,8 @@ def _classify_target(owner, data_path, index, prop=None):
 
 def _suggestion_ids_for_kind(target_kind):
     mapping = {
-        "Rotation": ("constant_speed", "sine_osc"),
-        "Rotation Channel": ("constant_speed", "sine_osc"),
+        "Rotation": ("constant_speed", "sine_osc", "ease_in_rotation"),
+        "Rotation Channel": ("constant_speed", "sine_osc", "ease_in_rotation"),
         "Scale": ("transition_smoothstep",),
         "Scale Channel": ("transition_smoothstep",),
         "Location": ("transition_linear",),
@@ -359,50 +325,15 @@ def resolve_button_multi_targets(context):
     return expand_multi_targets(clicked, multi_target_count(array_length))
 
 
-def _foreign_motion_on_button_targets(targets):
-    for target in targets:
-        owner = target.owner
-        root = getattr(owner, "id_data", None)
-        if root is None or root is owner:
-            root = owner
-            data_path = target.data_path
-        else:
-            prefix = owner.path_from_id()
-            data_path = "%s.%s" % (prefix, target.data_path) if prefix else target.data_path
-        animation = getattr(root, "animation_data", None)
-        if target.index < 0 and animation is not None:
-            indices = {curve.array_index for curve in animation.drivers
-                       if curve.data_path == data_path}
-        else:
-            indices = {target.index}
-        for index in indices:
-            foreign = core_driver_manager.foreign_live_motion_for_channel(
-                root, data_path, index,
-            )
-            if foreign is not None:
-                return "%s[%d] has motion from an unavailable edition (%s); it was left unchanged." % (
-                    data_path, index, foreign["label"],
-                )
-    return ""
-
-
 def apply_expression_to_targets(
     targets,
     expression,
     template,
     scene=None,
     rest_start_mode=utils.REST_START_OFF,
-    source_entry=None,
     output_baseline=None,
-    prepare_driver=None,
 ):
     props = getattr(scene, "espresso_props", None) if scene is not None else None
-    block_message = _button_flow_block_message(
-        template, scene_props=props, source_entry=source_entry,
-    )
-    if block_message:
-        return False, block_message, []
-
     plan_entry = {
         "apply_kind": "context_menu",
         "targets": [
@@ -411,40 +342,26 @@ def apply_expression_to_targets(
             )
             for target in targets
         ],
-        "source_entry": source_entry or {},
-        "source_required": source_binding.needs_input_source(template),
     }
     plan = application_plan.from_entry(plan_entry, template)
-    source_status = (
-        source_binding.source_status(source_entry)
-        if plan.source_required else {"code": source_binding.SOURCE_ACTIVE}
-    )
-    report = application_plan.preflight(plan, source_status=source_status)
+    report = application_plan.preflight(plan)
     if not report.ok:
         return False, report.errors[0], []
-    foreign_message = _foreign_motion_on_button_targets(targets)
-    if foreign_message:
-        return False, foreign_message, []
-
     applied = 0
     target_states = []
     captured = target_memory.capture_cleanup_for_targets(targets, props)
     for target in targets:
-        routed_expression = audio_reactivity.prepare_expression(
-            template, expression, scene, output_baseline,
-        ) if scene is not None else expression
         rest_state = apply_behavior.capture_target_rest_state(
             target,
-            routed_expression,
+            expression,
             template,
             scene,
             rest_start_mode,
             output_baseline=output_baseline,
         ) if scene is not None else {}
-        wrapped_expression = utils.wrap_expression_with_rest_state(routed_expression, template, rest_state)
-        validation_template = audio_reactivity.validation_template(template, scene) if scene is not None else template
+        wrapped_expression = utils.wrap_expression_with_rest_state(expression, template, rest_state)
         valid, message = utils.validate_driver_expression(
-            wrapped_expression, validation_template, scene,
+            wrapped_expression, template, scene,
         )
         if not valid:
             return False, message, []
@@ -459,43 +376,19 @@ def apply_expression_to_targets(
         for fcurve in fcurves:
             if fcurve is None:
                 continue
-            audio_bound = audio_reactivity.bind_driver(fcurve.driver, template, scene) if scene is not None else False
-            if not audio_bound:
-                ok, message = source_binding.bind_required_variables(
-                    fcurve.driver, template, source_entry,
-                    owner_object=getattr(target, "owner_object", None))
-                if not ok:
-                    return False, message, []
-                audio_reactivity.clear_variables(fcurve.driver, template)
-            # A caller that owns a variable the expression reads (a camera
-            # recipe's live ``dist``) binds it here, before the expression is
-            # assigned, so the driver is never evaluated without it.
-            if prepare_driver is not None:
-                prepared = prepare_driver(fcurve.driver)
-                if prepared is False:
-                    return False, "Could not bind the driver's variables.", []
-                if isinstance(prepared, tuple) and not prepared[0]:
-                    return False, prepared[1], []
             ok, message = utils.assign_driver_expression(
-                fcurve.driver, wrapped_expression, validation_template, scene,
+                fcurve.driver, wrapped_expression, template, scene,
             )
             if not ok:
                 return False, message, []
-            # The new expression is now safely stored. Any private helper
-            # bindings left by the expression it replaced are obsolete.
+            # The new expression is stored. Any private helper bindings left by the
+            # expression it replaced are obsolete.
             applied += 1
         target_states.append(rest_state)
 
     if applied == 0:
         return False, "No properties were driven.", []
 
-    # A direct driver on a socket replaces a generated spatial node route that
-    # fed that same socket. Remove only the group connected to this target;
-    # other Espresso groups in the node tree remain untouched.
-    for target in targets:
-        shared_material_sweep.remove_group_feeding_target_path(
-            target.owner, target.data_path,
-        )
     target_memory.cleanup_captured_resources(captured, scene, props)
 
     base = "Driver Espresso expression applied." if applied == 1 else f"Applied to {applied} properties."
@@ -505,19 +398,12 @@ def apply_expression_to_targets(
 def apply_current_template_to_button_targets(targets, scene_props, template, scene):
     """Apply the current single expression or complete multi-channel plan."""
     if template_catalogue.has_motion_plan(template):
-        # A ONE-channel motion plan names an axis, but that axis is only a
-        # sensible default for applying from the panel. Right-clicking a
-        # property names the target explicitly, and that has to win.
-        #
-        # It did not: Loose Panel Impact Rattle declares rotation_euler[2], so
-        # right-clicking Rotation X put the driver on Rotation Z. The operator
-        # reported success, a driver existed, and the property the artist was
-        # looking at never moved - indistinguishable from the apply doing
-        # nothing at all.
-        #
-        # Multi-channel plans still take the object route. Ball Bounce drives
-        # location AND three scale axes together; there is no single clicked
-        # property that could stand for the set.
+        # A one-channel motion plan names an axis, but that axis is only a sensible
+        # default for applying from the panel. Right-clicking a property names the
+        # target explicitly, and that wins: right-clicking Rotation X puts the driver on
+        # Rotation X even if the plan declares rotation_euler[2]. Multi-channel plans
+        # still take the object route. They drive several properties together, and no
+        # single clicked property could stand for the set.
         channels = template_catalogue.template_channels(template)
         if targets and len(channels) == 1:
             built = espresso_props.built_channel_previews(scene_props)
@@ -535,7 +421,6 @@ def apply_current_template_to_button_targets(targets, scene_props, template, sce
                 template,
                 scene=scene,
                 rest_start_mode=espresso_props.effective_rest_start_mode(scene_props),
-                source_entry=source_binding.latest_source(scene_props),
                 output_baseline=scene_props.preview_output_baseline,
             )
             return ok, message, target_states, targets
@@ -548,10 +433,9 @@ def apply_current_template_to_button_targets(targets, scene_props, template, sce
             scene=scene,
             rest_start_mode=espresso_props.effective_rest_start_mode(scene_props),
             enabled_channel_ids=espresso_props.enabled_channel_ids_for_template(scene_props, template),
-            template_values=espresso_props.collect_values(scene_props, template),
         ) if obj is not None else motion_channels.MotionApplyResult(
             False,
-            "Right-click a transform on an Object to apply this motion template.",
+            "Right-click a colour on an Object to apply this motion template.",
         )
         return result.ok, result.message, result.target_states, result.targets
 
@@ -561,7 +445,6 @@ def apply_current_template_to_button_targets(targets, scene_props, template, sce
         template,
         scene=scene,
         rest_start_mode=espresso_props.effective_rest_start_mode(scene_props),
-        source_entry=source_binding.latest_source(scene_props),
         output_baseline=scene_props.preview_output_baseline,
     )
     return ok, message, target_states, targets
@@ -586,7 +469,6 @@ def paste_copied_driver_to_targets(targets, scene_props, scene):
         template,
         scene=scene,
         rest_start_mode=getattr(scene_props, "copied_driver_rest_mode", utils.REST_START_OFF),
-        source_entry=source_binding._read_entry(getattr(scene_props, "copied_driver_source", "{}")),
         output_baseline=getattr(scene_props, "copied_driver_output_baseline", 0.0),
     )
 
@@ -683,13 +565,11 @@ def _output_range_warning(context, template):
 
 
 def template_fits_button_target(context, scene_props=None, template=None):
-    """Can the loaded template actually drive the property under the cursor?
-
-    The single fitness test every apply entry in this menu shares. It was once
-    written into plain apply's poll alone, so the multi-object entries stayed
-    lit for templates that could not reach the clicked property at all - they
-    route through the same apply helper, so being lit bought nothing but a
-    warning per object and a cancel.
+    """Can the loaded template drive the property under the cursor? The single fitness
+    test every apply entry in this menu shares. The multi-object entries route
+    through the same apply helper as plain apply, so they must use the same test;
+    otherwise they would stay lit for templates that cannot reach the clicked
+    property.
     """
     if scene_props is None:
         scene_props = getattr(getattr(context, "scene", None), "espresso_props", None)
@@ -706,7 +586,7 @@ def template_fits_button_target(context, scene_props=None, template=None):
     # or a node input has no Object to resolve, and the plan has nowhere to go.
     if template_catalogue.has_motion_plan(template):
         return motion_channels.resolve_motion_object(targets[0].owner) is not None
-    return not _button_flow_block_message(template, scene_props)
+    return True
 
 
 class ESPRESSO_OT_apply_to_button(bpy.types.Operator):
@@ -745,15 +625,6 @@ class ESPRESSO_OT_apply_to_button(bpy.types.Operator):
 
         template = espresso_props.get_current_template(scene_props)
 
-        # A palette template drives a POSITION along a ramp, not a colour. On a
-        # colour socket the plain apply would drive red, green and blue to that
-        # same number and produce grey - a valid driver that does nothing
-        # anyone wants. The setup it was written for is one click away in this
-        # same menu, so take it rather than leaving the artist to find out by
-        # looking at a grey object.
-        if wants_palette(template) and _colour_socket_target(context) is not None:
-            return ESPRESSO_OT_apply_ramp_to_socket.execute(self, context)
-
         ok, message, target_states, applied_targets = apply_current_template_to_button_targets(
             targets, scene_props, template, context.scene,
         )
@@ -779,112 +650,6 @@ class ESPRESSO_OT_apply_to_button(bpy.types.Operator):
         return {"FINISHED"}
 
 
-# Templates whose output is a position along a palette rather than a value in
-# its own right. Applying one to a colour means building the ramp it selects
-# from; applying it to a scalar means driving that scalar directly.
-PALETTE_FACTOR_TEMPLATES = frozenset()
-
-
-def wants_palette(template):
-    return bool(template) and template.get("id") in PALETTE_FACTOR_TEMPLATES
-
-
-def _colour_socket_target(context):
-    """The clicked socket, when it is a colour input on a shader node.
-
-    Returns ``(node_tree, node, socket)`` or None. A ramp only makes sense
-    feeding a colour: offering it on a scalar would produce a driver that
-    cannot be wired.
-    """
-    button = getattr(context, "button_pointer", None)
-    prop = getattr(context, "button_prop", None)
-    if button is None or prop is None:
-        return None
-    if getattr(prop, "identifier", "") != "default_value":
-        return None
-    node = getattr(button, "node", None)
-    if node is None or getattr(button, "is_output", False):
-        return None
-    if getattr(button, "type", "") not in {"RGBA", "VECTOR"}:
-        return None
-    tree = getattr(node, "id_data", None)
-    if tree is None or not hasattr(tree, "links"):
-        return None
-    return tree, node, button
-
-
-class ESPRESSO_OT_apply_ramp_to_socket(bpy.types.Operator):
-    """Insert a Colour Ramp into this socket and drive its Factor.
-
-    The ramp templates drive a single number and let a Colour Ramp hold the
-    palette, which is what allows unlimited colours. Applying one straight to a
-    colour socket cannot work - it would drive red, green and blue to the same
-    number and produce grey. This builds the setup the template was written
-    for, in one click, instead of leaving the artist to discover it.
-    """
-
-    bl_idname = "espresso.apply_ramp_to_socket"
-    bl_label = "Apply as Colour Ramp"
-    bl_description = (
-        "Insert a Colour Ramp feeding this colour, drive its Factor with the "
-        "current template, and copy the palette configured in Parameters. "
-        "After applying, edit the material copy in the Shader Editor"
-    )
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        props = getattr(getattr(context, "scene", None), "espresso_props", None)
-        if props is None or not props.is_valid:
-            return False
-        return _colour_socket_target(context) is not None
-
-    def execute(self, context):
-        from ...apply import colour_ramp
-
-        found = _colour_socket_target(context)
-        if found is None:
-            self.report({"WARNING"}, "Right-click a colour input on a node to use this.")
-            return {"CANCELLED"}
-        tree, node, socket = found
-
-        props = context.scene.espresso_props
-        template = espresso_props.get_current_template(props)
-        values = espresso_props.collect_values(props, template)
-        stops = int(values.get("STOPS", 4) or 4)
-        source_ramp = colour_ramp.template_ramp(context.scene)
-
-        ramp = colour_ramp.build_ramp_for_socket(
-            tree, node, socket, stops=stops, source_ramp=source_ramp)
-        factor = colour_ramp.factor_socket(ramp)
-        data_path = factor.path_from_id("default_value")
-
-        # Reuse the ordinary button-apply path rather than hand-rolling the
-        # driver: it already handles source binding, validation and rest-start
-        # exactly as every other apply does, so this cannot drift from them.
-        target = ButtonDriverTarget(tree, data_path, -1)
-        ok, message, target_states, applied = apply_current_template_to_button_targets(
-            [target], props, template, context.scene,
-        )
-        if not ok:
-            colour_ramp.remove_palette_group(tree, ramp)
-            self.report({"WARNING"}, message)
-            return {"CANCELLED"}
-
-        target_memory.remember_targets(
-            context, applied,
-            "%s > %s Factor" % (getattr(tree, "name", "Nodes"), ramp.name),
-            "template", template["id"], template["name"],
-            target_states=target_states,
-        )
-        self.report(
-            {"INFO"},
-            "Colour Ramp added with %d colours and driven by %s. Edit its stops "
-            "in the Shader Editor." % (stops, template["name"]),
-        )
-        return {"FINISHED"}
-
-
 def material_slot_index(reference_owner, reference_object):
     """Which material slot ``reference_owner`` is, or None if it is not one."""
     data = getattr(reference_object, "data", None)
@@ -896,12 +661,10 @@ def material_slot_index(reference_owner, reference_object):
 
 
 def unshare_material(obj, slot_index, want_node_tree):
-    """Give ``obj`` its own copy of the material in ``slot_index``.
-
-    A material shared between objects is ONE datablock, so its driver is
-    evaluated once and every object gets the identical value - measured, four
-    objects all reading 1.0. No amount of variable rewiring changes that; the
-    only way to vary a material per object is for each object to have its own.
+    """Give ``obj`` its own copy of the material in ``slot_index``. A material shared
+    between objects is one datablock, so its driver is evaluated once and every
+    object gets the identical value; rewiring variables cannot change that. Varying a
+    material per object requires each object to have its own.
     """
     data = getattr(obj, "data", None)
     materials = getattr(data, "materials", None)
@@ -919,6 +682,15 @@ def unshare_material(obj, slot_index, want_node_tree):
         material = material.copy()
         materials[slot_index] = material
     return (material.node_tree if want_node_tree else material), ""
+
+
+def _has_property(owner, data_path):
+    """Whether ``data_path`` resolves on ``owner`` (a modifier the other object lacks does not)."""
+    try:
+        owner.path_resolve(data_path)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
 
 
 def equivalent_owner(reference_owner, reference_object, other_object):
@@ -952,13 +724,9 @@ def equivalent_owner(reference_owner, reference_object, other_object):
 
 
 class ESPRESSO_OT_use_as_apply_target(bpy.types.Operator):
-    """Remember this property as what "apply to my selection" should drive.
-
-    The mirror of Use as Espresso Input. That one names where a value comes
-    FROM; this names where it goes TO. Before it existed, applying across a
-    selection could only ever write to a light's Power - so a brightness
-    template could reach a lamp but not an emission shader, and a selection of
-    meshes made the button do nothing at all, silently.
+    """Remember this property as what "apply to my selection" should drive. The mirror
+    of Use as Espresso Input: that one names where a value comes from, this names
+    where it goes to.
     """
 
     bl_idname = "espresso.use_as_apply_target"
@@ -1022,11 +790,11 @@ class ESPRESSO_OT_clear_apply_target(bpy.types.Operator):
 class ESPRESSO_OT_apply_to_selected_objects(bpy.types.Operator):
     """Apply this template to the same property on every selected object.
 
-    Blender's own "Copy Drivers to Selected" copies the variable TARGETS along
-    with the driver, so a position-aware template would leave every object
-    reading the ACTIVE object's position - measured, and the whole effect
-    collapses to one value. This applies the template afresh per object so each
-    driver's variables bind to the object they land on.
+    Blender's own "Copy Drivers to Selected" copies the variable targets along with the
+    driver, so a position-aware template would leave every object reading the active
+    object's position and the effect would collapse to one value. This applies the
+    template afresh per object so each driver's variables bind to the object they land
+    on.
     """
 
     bl_idname = "espresso.apply_to_selected_objects"
@@ -1073,37 +841,13 @@ class ESPRESSO_OT_apply_to_selected_objects(bpy.types.Operator):
         if active in selected:                      # apply to the active FIRST
             selected.remove(active)
             selected.insert(0, active)
-        for obj in selected:
-            planned = []
-            for target in targets:
-                owner = equivalent_owner(target.owner, active, obj)
-                if owner is not None:
-                    planned.append(ButtonDriverTarget(owner, target.data_path, target.index))
-            if not planned:
-                continue
-            channels = template_catalogue.template_channels(template)
-            if template_catalogue.has_motion_plan(template) and len(channels) > 1:
-                motion_object = motion_channels.resolve_motion_object(planned[0].owner)
-                enabled = espresso_props.enabled_channel_ids_for_template(props, template)
-                if motion_object is not None:
-                    planned = [ButtonDriverTarget(motion_object, channel["data_path"],
-                                                   int(channel.get("index", -1)))
-                               for channel in channels
-                               if channel.get("data_path") and
-                               (enabled is None or channel.get("id") in enabled)]
-            foreign_message = _foreign_motion_on_button_targets(planned)
-            if foreign_message:
-                self.report({"WARNING"}, "%s: %s" % (obj.name, foreign_message))
-                return {"CANCELLED"}
-        espresso_props.refresh_position_wave_auto_fit(props, context, selected)
-
         applied_all, states_all, skipped, done = [], [], [], 0
         seen_owners, shared, unsplittable = {}, [], []
         for obj in selected:
             per_object = []
             for target in targets:
                 owner = equivalent_owner(target.owner, active, obj)
-                if owner is None:
+                if owner is None or not _has_property(owner, target.data_path):
                     continue
 
                 # The same datablock reached twice means these objects SHARE
@@ -1131,7 +875,8 @@ class ESPRESSO_OT_apply_to_selected_objects(bpy.types.Operator):
                 per_object.append(ButtonDriverTarget(
                     owner, target.data_path, target.index, owner_object=obj))
             if not per_object:
-                skipped.append(obj.name)
+                if obj.name not in shared and not any(item.startswith(obj.name + " ") for item in unsplittable):
+                    skipped.append(obj.name)
                 continue
             ok, message, states, applied = apply_current_template_to_button_targets(
                 per_object, props, template, context.scene,
@@ -1153,15 +898,16 @@ class ESPRESSO_OT_apply_to_selected_objects(bpy.types.Operator):
             "template", template["id"], template["name"],
             target_states=states_all,
         )
-        note = "Applied %s to %d objects." % (template["name"], done)
+        note = "Applied %s to %d object%s." % (template["name"], done, "" if done == 1 else "s")
         if skipped:
             note += " Skipped %d without that property: %s." % (
                 len(skipped), ", ".join(skipped[:3]) + ("..." if len(skipped) > 3 else ""))
         if shared:
             note += (
-                " %d objects share that datablock, so they would all show the "
+                " %d object%s share%s that datablock, so they would all show the "
                 "same value - use \"Apply to Selected (Split Shared "
-                "Materials)\" to give each its own copy." % len(shared))
+                "Materials)\" to give each its own copy." % (
+                    len(set(shared)), "" if len(set(shared)) == 1 else "s", "s" if len(set(shared)) == 1 else ""))
         if unsplittable:
             note += " Could not split: %s." % "; ".join(unsplittable[:3])
         espresso_props.set_last_apply_status(props, note)
@@ -1174,7 +920,7 @@ class ESPRESSO_OT_apply_to_button_multi(bpy.types.Operator):
     bl_idname = "espresso.apply_to_button_multi"
     bl_label = "Apply Current Template (Multi)"
     bl_description = "Add drivers and apply the current Driver Espresso template to every value in this arrayed property"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
     @classmethod
     def poll(cls, context):
@@ -1184,8 +930,7 @@ class ESPRESSO_OT_apply_to_button_multi(bpy.types.Operator):
         if len(resolve_button_multi_targets(context)) < 2:
             return False
         template = espresso_props.get_current_template(scene_props)
-        # A MULTI-channel plan owns its own channels - Ball Bounce drives
-        # location and three scale axes together - so "every index of the
+        # A MULTI-channel plan owns its own channels, so "every index of the
         # clicked array" means nothing for it and the entry stays hidden.
         #
         # A SINGLE-channel plan is one expression with a default axis, and now
@@ -1195,7 +940,7 @@ class ESPRESSO_OT_apply_to_button_multi(bpy.types.Operator):
         if template_catalogue.has_motion_plan(template):
             if len(template_catalogue.template_channels(template)) > 1:
                 return False
-        return not _button_flow_block_message(template, scene_props)
+        return True
 
     def execute(self, context):
         scene_props = context.scene.espresso_props
@@ -1205,11 +950,9 @@ class ESPRESSO_OT_apply_to_button_multi(bpy.types.Operator):
             return {"CANCELLED"}
 
         template = espresso_props.get_current_template(scene_props)
-        # Route through the shared helper rather than repeating its branch.
-        # This had its own copy of the motion-plan logic, so the fix that makes
-        # a single-channel template honour the clicked property landed in one
-        # path and not the other - multi would still have driven the template's
-        # declared axis while plain apply drove the click.
+        # Route through the shared helper rather than repeating its branch, so a
+        # single-channel template honours the clicked property here exactly as plain
+        # apply does.
         ok, message, target_states, applied_targets = (
             apply_current_template_to_button_targets(
                 targets, scene_props, template, context.scene,
@@ -1249,9 +992,7 @@ class ESPRESSO_OT_paste_copied_to_button(bpy.types.Operator):
             return False
         from ...catalogue.core.templates import TEMPLATE_BY_ID
 
-        template = TEMPLATE_BY_ID.get(scene_props.copied_driver_template)
-        copied_source = source_binding._read_entry(getattr(scene_props, "copied_driver_source", "{}"))
-        return bool(template and not _button_flow_block_message(template, source_entry=copied_source))
+        return TEMPLATE_BY_ID.get(scene_props.copied_driver_template) is not None
 
     def execute(self, context):
         scene_props = context.scene.espresso_props
@@ -1322,18 +1063,13 @@ class ESPRESSO_OT_open_panel_popup(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        # Deliberately NOT gated on a button under the cursor. Blender re-runs
-        # poll() immediately before execute(), in the context the OK button
-        # lives in -- and by then the right-click button context is gone. A
-        # poll that demanded it made OK fail its poll silently: no execute(),
-        # no driver, no warning, and the dialog simply closed. Measured: the
-        # same execute() lands the driver the moment poll() is satisfied.
-        #
-        # The menu item is already gated where the gating belongs:
-        # draw_button_context_menu() returns before drawing anything when
-        # nothing under the cursor is drivable, and invoke() below refuses to
-        # open a dialog without a target. Nothing is lost by relaxing this;
-        # the confirm path is what was broken.
+        # Deliberately not gated on a button under the cursor. Blender re-runs poll()
+        # immediately before execute(), in the context the OK button lives in, and by
+        # then the right-click button context is gone; a poll that demanded it would
+        # make OK fail silently. The menu item is already gated where it belongs:
+        # draw_button_context_menu() returns before drawing anything when nothing under
+        # the cursor is drivable, and invoke() below refuses to open a dialog without a
+        # target.
         scene_props = getattr(getattr(context, "scene", None), "espresso_props", None)
         return bool(scene_props)
 
@@ -1378,14 +1114,13 @@ class ESPRESSO_OT_open_panel_popup(bpy.types.Operator):
             self.report({"WARNING"}, scene_props.validation_message or "Expression is invalid — check your template parameters.")
             return {"CANCELLED"}
 
-        # Guard: block templates that require driver variables the button flow can't set up.
-        block_message = _button_flow_block_message(template, scene_props)
+        block_message = ""
         if template_catalogue.has_motion_plan(template):
             popup_targets = _popup_cache_targets(self.target_cache_key)
             if not popup_targets:
                 popup_targets, _label = _resolve_popup_target_snapshot(self.target_snapshot_json)
             if not popup_targets or motion_channels.resolve_motion_object(popup_targets[0].owner) is None:
-                block_message = "Right-click an Object transform to apply this multi-expression motion template."
+                block_message = "Right-click a colour on an Object to apply this motion template."
         if block_message:
             _clear_popup_cache(self.target_cache_key)
             self.report({"WARNING"}, block_message)
@@ -1458,17 +1193,10 @@ class ESPRESSO_OT_open_panel_popup(bpy.types.Operator):
         op = nav.operator("espresso.navigate_template", text="", icon="TRIA_RIGHT")
         op.direction = 1
 
-        if template.get("warning"):
-            warn_box = layout.box()
-            warn_box.alert = True
-            panels.draw_wrapped(warn_box, template["warning"], icon="ERROR", width=54)
-
         # --- Condensed collapsible variants (2-column grid on expand) ---
         variant_ids = [vid for vid in (template.get("variants") or []) if vid in TEMPLATE_BY_ID]
-        pair_id = template.get("pair_with")
-        has_pair = bool(pair_id and pair_id in TEMPLATE_BY_ID)
-        if variant_ids or has_pair:
-            count = len(variant_ids) + (1 if has_pair else 0)
+        if variant_ids:
+            count = len(variant_ids)
             vrow = layout.row(align=True)
             vrow.prop(
                 self, "variants_open", text="", emboss=False,
@@ -1477,10 +1205,6 @@ class ESPRESSO_OT_open_panel_popup(bpy.types.Operator):
             vrow.label(text=f"Variants ({count})", icon="GRAPH")
             if self.variants_open:
                 vbox = layout.box()
-                if has_pair:
-                    pair = TEMPLATE_BY_ID[pair_id]
-                    op = vbox.operator("espresso.switch_variant", text=f"Pair: {pair['name']}", icon="LINKED")
-                    op.variant_id = pair_id
                 grid = vbox.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
                 for vid in variant_ids:
                     variant = TEMPLATE_BY_ID[vid]
@@ -1520,14 +1244,14 @@ class ESPRESSO_OT_open_panel_popup(bpy.types.Operator):
             style_row.prop(props, "visualizer_detailed", text="Detailed", toggle=True)
             panels._draw_graph_block(prev_box, props, template, context)
 
-        block_message = _button_flow_block_message(template, props)
+        block_message = ""
 
         if template_catalogue.has_motion_plan(template):
             popup_targets = _popup_cache_targets(self.target_cache_key)
             if not popup_targets:
                 popup_targets, _label = _resolve_popup_target_snapshot(self.target_snapshot_json)
             if not popup_targets or motion_channels.resolve_motion_object(popup_targets[0].owner) is None:
-                block_message = "Right-click an Object transform to apply this multi-expression motion template."
+                block_message = "Right-click a colour on an Object to apply this motion template."
 
         # Disable the apply toggle when the template can't be applied via button flow.
         toggle_row = layout.row(align=True)
@@ -1679,107 +1403,10 @@ class ESPRESSO_OT_relink_button_input(bpy.types.Operator):
         return {"FINISHED"}
 
 
-# ESPRESSO_OT_remove_driver_from_button was removed: it duplicated Blender's own
-# Delete Drivers / Delete Single Driver, which appear at the top of the same
-# right-click menu and handle every case correctly. Clearing whole transform
-# channels across a selection is a different job and lives in
+# There is no remove_driver_from_button operator: Blender's own Delete Drivers / Delete
+# Single Driver appear at the top of the same right-click menu and handle every case.
+# Clearing whole transform channels across a selection is a different job and lives in
 # espresso.clear_transform_drivers.
-
-
-def _pairable_vector_target(context):
-    """Return (owner, data_path) when the clicked property is an array of >=2
-    components and the current template has a paired template; else None."""
-    scene_props = getattr(getattr(context, "scene", None), "espresso_props", None)
-    if not (scene_props and scene_props.is_valid):
-        return None
-    template = espresso_props.get_current_template(scene_props)
-    pair_id = template.get("pair_with")
-    if not pair_id or pair_id not in TEMPLATE_BY_ID:
-        return None
-    if _required_variable_names(template) or _required_variable_names(TEMPLATE_BY_ID[pair_id]):
-        return None
-    prop = getattr(context, "button_prop", None)
-    if prop is None or not getattr(prop, "is_array", False):
-        return None
-    if int(getattr(prop, "array_length", 0) or 0) < 2:
-        return None
-    targets = resolve_button_driver_targets(context)
-    if not targets:
-        return None
-    return targets[0].owner, targets[0].data_path
-
-
-class ESPRESSO_OT_apply_pair_to_button(bpy.types.Operator):
-    bl_idname = "espresso.apply_pair_to_button"
-    bl_label = "Apply Paired Templates (X/Y)"
-    bl_description = "Drive the first two channels with this template and its paired template (e.g. circle/figure-8 X and Y)"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        return _pairable_vector_target(context) is not None
-
-    def execute(self, context):
-        info = _pairable_vector_target(context)
-        if info is None:
-            self.report({"WARNING"}, "No pairable vector property found.")
-            return {"CANCELLED"}
-        owner, data_path = info
-        scene_props = context.scene.espresso_props
-        template = espresso_props.get_current_template(scene_props)
-        pair = TEMPLATE_BY_ID[template["pair_with"]]
-
-        from ...engine import utils
-
-        pair_expr, _warn = utils.build_expression(pair, {}, context.scene)
-        plans = [(0, scene_props.preview), (1, pair_expr)]
-        for _index, expression in plans:
-            valid, message = utils.validate_driver_expression(
-                expression, template, context.scene,
-            )
-            if not valid:
-                self.report({"WARNING"}, message)
-                return {"CANCELLED"}
-        foreign_message = _foreign_motion_on_button_targets(
-            [ButtonDriverTarget(owner, data_path, index) for index, _expression in plans]
-        )
-        if foreign_message:
-            self.report({"WARNING"}, foreign_message)
-            return {"CANCELLED"}
-        applied = 0
-        for index, expression in plans:
-            try:
-                result = owner.driver_add(data_path, index)
-            except Exception as exc:
-                self.report({"WARNING"}, f"Could not drive channel {index}: {exc}")
-                return {"CANCELLED"}
-            fcurves = result if isinstance(result, list) else [result]
-            for fcurve in fcurves:
-                if fcurve is None:
-                    continue
-                ok, message = utils.assign_driver_expression(
-                    fcurve.driver, expression, template, context.scene,
-                )
-                if not ok:
-                    self.report({"WARNING"}, message)
-                    return {"CANCELLED"}
-                applied += 1
-        applied = [ButtonDriverTarget(owner, data_path, index) for index, _expression in plans]
-        inspector = inspect_button_target(context)
-        target_memory.remember_targets(
-            context,
-            applied,
-            inspector.display_label if inspector else "",
-            "template",
-            template["id"],
-            template["name"],
-        )
-        espresso_props.set_last_apply_status(
-            scene_props,
-            f"Remembered: {target_memory.latest_label(scene_props) or 'target'}",
-        )
-        self.report({"INFO"}, f"Applied {template['name']} + {pair['name']} to X/Y.")
-        return {"FINISHED"}
 
 
 def _channel_plan_on_clicked_array(context):
@@ -1806,9 +1433,6 @@ def _channel_plan_on_clicked_array(context):
     template = espresso_props.get_current_template(scene_props)
     if not template_catalogue.has_motion_plan(template):
         return None
-    if _button_flow_block_message(template, scene_props):
-        return None
-
     channels = [c for c in template_catalogue.template_channels(template) if c.get("data_path")]
     if len(channels) < 2:
         return None
@@ -1839,7 +1463,7 @@ class ESPRESSO_OT_apply_channels_to_button(bpy.types.Operator):
         "Drive each component of this property with its matching channel from "
         "the current multi-channel template"
     )
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
     @classmethod
     def poll(cls, context):
@@ -1874,13 +1498,6 @@ class ESPRESSO_OT_apply_channels_to_button(bpy.types.Operator):
                 self.report({"WARNING"}, f"{channel.get('label', '')}: {message}")
                 return {"CANCELLED"}
 
-        foreign_message = _foreign_motion_on_button_targets(
-            [ButtonDriverTarget(owner, data_path, index) for index, _expression, _channel in plans]
-        )
-        if foreign_message:
-            self.report({"WARNING"}, foreign_message)
-            return {"CANCELLED"}
-
         applied = 0
         for index, expression, channel in plans:
             try:
@@ -1900,8 +1517,7 @@ class ESPRESSO_OT_apply_channels_to_button(bpy.types.Operator):
                 applied += 1
         # Record what was driven. Without this, "Update Last Targets" and
         # "Clear Applied Drivers" have nothing to act on - the apply worked but
-        # the panel could not follow it up. Copied the apply pattern from
-        # apply_pair_to_button, which had the same gap; both are fixed now.
+        # the panel could not follow it up.
         applied = [ButtonDriverTarget(owner, data_path, index) for index, _e, _c in plans]
         inspector = inspect_button_target(context)
         target_memory.remember_targets(
@@ -2012,14 +1628,11 @@ def draw_button_context_menu(self, context):
 
     scene_props = getattr(getattr(context, "scene", None), "espresso_props", None)
 
-    # The block, in three groups: what to APPLY, what to BIND, and the two
-    # utilities. It grew one entry at a time and read as one flat list of
-    # fifteen, most of them starting with the word "Apply".
-    #
-    # An entry that cannot act on the property under the cursor is left out
-    # rather than drawn greyed - a dead row says nothing its absence does not,
-    # and this sits at the bottom of a menu that already carries Blender's own
-    # driver commands and two other add-ons.
+    # The block, in three groups: what to apply, what to bind, and the two utilities. An
+    # entry that cannot act on the property under the cursor is left out rather than
+    # drawn greyed, since a dead row says nothing its absence does not, and this sits at
+    # the bottom of a menu that already carries Blender's own driver commands and other
+    # add-ons.
 
     current_template = espresso_props.get_current_template(scene_props) if scene_props else None
 
@@ -2034,10 +1647,9 @@ def draw_button_context_menu(self, context):
             layout.menu("ESPRESSO_MT_apply_template", icon="DRIVER")
         layout.separator()
 
-    # 2. Binding: where a value comes FROM, where it goes TO, and repointing
-    # both at something else. From the same table as the apply family, so
-    # Target can be gated on the templates that can actually consume one
-    # without a second opinion living here.
+    # 2. Binding: where a value comes from, where it goes to, and repointing both at
+    #    something else. From the same table as the apply family, so Target can be gated
+    #    on the templates that can consume one.
     for entry in button_menu_map.entries_in_group(
             context, scene_props, current_template, button_menu_map.BINDING):
         layout.operator(
@@ -2055,24 +1667,16 @@ def draw_button_context_menu(self, context):
     if paste_enabled:
         from ...catalogue.core.templates import TEMPLATE_BY_ID
 
-        copied_template = TEMPLATE_BY_ID.get(scene_props.copied_driver_template)
-        copied_source = source_binding._read_entry(getattr(scene_props, "copied_driver_source", "{}"))
-        paste_enabled = bool(copied_template and not _button_flow_block_message(copied_template, source_entry=copied_source))
+        paste_enabled = TEMPLATE_BY_ID.get(scene_props.copied_driver_template) is not None
     if paste_enabled:
         label = "Paste Copied Driver"
         if scene_props.copied_driver_label:
             label = "Paste Copied Driver: " + scene_props.copied_driver_label
         layout.operator("espresso.paste_copied_to_button", text=label, icon="PASTEDOWN")
 
-    # Baking existing drivers belongs HERE rather than in the N-panel, because
-    # it acts on the property under the cursor rather than on the template on
-    # screen. The panel keeps only Bake Last Drivers, which finishes what the
-    # template itself applied.
-    #
-    # This entry was once removed on the reasoning that baking any driver is
-    # Driver Tools' job. That still holds for a driver Espresso never made, but
-    # the action was living in the N-panel in the meantime, which is the one
-    # place it does not belong - the panel is about the current template.
+    # Baking existing drivers belongs here rather than in the N-panel, because it acts
+    # on the property under the cursor rather than on the template on screen. The panel
+    # keeps only Bake Last Drivers, which finishes what the template itself applied.
     layout.operator(
         "espresso.bake_drivers",
         text="Bake Drivers to Keyframes…",
@@ -2083,14 +1687,8 @@ def draw_button_context_menu(self, context):
 
     layout.operator("espresso.open_panel_popup", text="Open Espresso Panel (Floating)", icon="PREFERENCES")
 
-    # No "Apply as Colour Ramp" entry. The ramp is configured in Parameters
-    # before applying now, and plain apply already builds it from those stops
-    # when a palette template lands on a colour socket - see the wants_palette
-    # branch in ESPRESSO_OT_apply_to_button.execute.
-
-    # No "Remove Driver" entry: Blender's own Delete Drivers / Delete Single
-    # Driver sit at the top of this very menu and do the job properly. Repeating
-    # it here only made our block longer and the choice ambiguous.
+    # No "Remove Driver" entry: Blender's own Delete Drivers / Delete Single Driver sit
+    # at the top of this menu and do the job properly.
 
 
 # The bake popup lives in operators.py: context_menu imports operators, so a
@@ -2123,11 +1721,11 @@ class ESPRESSO_OT_apply_and_bake_to_button(_BakeOptionsMixin, bpy.types.Operator
         self._commit_range(context)
         from ...engine import bake
 
-        # Anchor the apply at the bake START frame. Additive Rest Start snaps to
-        # the current frame and holds everything before it flat - so applying at
-        # the playhead and baking from frame 1 would bake a null run up to the
-        # playhead. Moving the frame to bake_start first makes the effect begin
-        # where the bake begins, and we restore the playhead afterwards.
+        # Anchor the apply at the bake start frame. Additive Rest Start snaps to the
+        # current frame and holds everything before it flat, so applying at the playhead
+        # and baking from frame 1 would bake a null run up to the playhead. The frame is
+        # moved to bake_start first so the effect begins where the bake begins, and the
+        # playhead is restored afterwards.
         scene = context.scene
         original_frame = scene.frame_current
         scene.frame_set(int(self.bake_start))
@@ -2175,27 +1773,6 @@ class ESPRESSO_OT_apply_and_bake_to_button(_BakeOptionsMixin, bpy.types.Operator
         return {"FINISHED"}
 
 
-def _driven_button_targets(context):
-    """Right-click targets that actually have a driver on them."""
-    driven = []
-    for target in resolve_button_driver_targets(context):
-        owner = target.owner
-        id_data = getattr(owner, "id_data", None)
-        anim = getattr(id_data, "animation_data", None) if id_data else getattr(owner, "animation_data", None)
-        if anim is None:
-            continue
-        try:
-            local = owner.path_from_id() if id_data and id_data is not owner else ""
-        except Exception:
-            local = ""
-        full = f"{local}.{target.data_path}" if local else target.data_path
-        for driver in anim.drivers:
-            if driver.data_path == full and (target.index < 0 or driver.array_index == target.index):
-                driven.append(target)
-                break
-    return driven
-
-
 def _entry_button_targets(entry):
     """Rebuild ButtonDriverTargets from a remembered apply entry."""
     from ...apply import target_memory as _tm
@@ -2213,7 +1790,6 @@ def _entry_button_targets(entry):
 CLASSES = (
     ESPRESSO_MT_apply_template,
     ESPRESSO_OT_apply_to_button,
-    ESPRESSO_OT_apply_ramp_to_socket,
     ESPRESSO_OT_use_as_apply_target,
     ESPRESSO_OT_clear_apply_target,
     ESPRESSO_OT_apply_to_selected_objects,
@@ -2222,7 +1798,6 @@ CLASSES = (
     ESPRESSO_OT_open_panel_popup,
     ESPRESSO_OT_use_button_as_input,
     ESPRESSO_OT_relink_button_input,
-    ESPRESSO_OT_apply_pair_to_button,
     ESPRESSO_OT_apply_channels_to_button,
     ESPRESSO_OT_apply_multi_to_button,
     ESPRESSO_OT_apply_and_bake_to_button,
@@ -2232,12 +1807,12 @@ CLASSES = (
 def _remove_our_menu_draws():
     """Drop our draw function even when it came from a previous module instance.
 
-    ``Menu.remove`` matches by object identity. Reloading the add-on rebuilds
-    this module, so the function appended by the previous load is a *different*
-    object that unregister can no longer reach: it stays in the menu, and the
-    next register appends another one. That is exactly why the right-click menu
-    grows an extra "Driver Espresso" block on every reload or update. Matching
-    by name removes ours whichever module instance created it.
+    ``Menu.remove`` matches by object identity. Reloading the add-on rebuilds this
+    module, so the function appended by the previous load is a different object that
+    unregister can no longer reach: it stays in the menu, and the next register appends
+    another, so the right-click menu would gain an extra "Driver Espresso" block on
+    every reload or update. Matching by name removes ours whichever module instance
+    created it.
     """
     menu = getattr(bpy.types, "UI_MT_button_context_menu", None)
     if menu is None:
@@ -2248,20 +1823,8 @@ def _remove_our_menu_draws():
             menu.remove(func)
 
 
-def _shipped_classes():
-    """CLASSES minus the operators this build has no template for.
-
-    `Apply Paired Templates (X/Y)` needs a template with a `pair_with`. In a
-    build that ships none, its poll can never pass and its menu entry is hidden,
-    so registering it only puts a dead command into F3 search.
-    """
-    if any(item.get("pair_with") for item in TEMPLATE_BY_ID.values()):
-        return CLASSES
-    return tuple(cls for cls in CLASSES if cls is not ESPRESSO_OT_apply_pair_to_button)
-
-
 def register():
-    for cls in _shipped_classes():
+    for cls in CLASSES:
         bpy.utils.register_class(cls)
     # Self-healing: clears strays a previous load's unregister could not reach,
     # so an already-duplicated menu repairs itself on the next enable rather
@@ -2272,5 +1835,5 @@ def register():
 
 def unregister():
     _remove_our_menu_draws()
-    for cls in reversed(_shipped_classes()):
+    for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

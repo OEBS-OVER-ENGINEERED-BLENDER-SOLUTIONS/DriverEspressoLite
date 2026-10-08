@@ -1,10 +1,9 @@
 """Lightweight CPU expression preview for Driver Espresso.
 
-Samples the generated expression string in a restricted namespace over a frame
-range and renders it as text in several chart styles (line / bars / filled /
-mirror / stats). The module is Blender-free apart from nothing — it only imports
-``utils`` (also Blender-free) so every renderer can be unit-tested outside
-Blender. An optional RGBA pixel buffer is produced for the image-graph mode; the
+Samples the generated expression string in a restricted namespace over a frame range and
+renders it as text in several chart styles (line / bars / filled / mirror / stats). The
+module only imports ``utils`` (also Blender-free), so every renderer can be unit-tested
+outside Blender. An optional RGBA pixel buffer is produced for the image-graph mode; the
 Blender-side preview wiring lives in ``image_preview.py``.
 """
 
@@ -16,6 +15,7 @@ import json
 import math
 
 from ...engine import utils
+from ...engine.expression import formula_reader
 from ...catalogue.core import channel_identity
 
 
@@ -53,7 +53,7 @@ _CACHE = {}
 # --------------------------------------------------------------------------- #
 def _make_cache_key(
     expression, template, frame_start, frame_end, sample_count,
-    helper_expressions=None, series_visibility=None,
+    series_visibility=None,
 ):
     raw = "|".join(
         [
@@ -62,16 +62,15 @@ def _make_cache_key(
             format(float(frame_start), ".9g"),
             format(float(frame_end), ".9g"),
             str(int(sample_count)),
-            json.dumps(helper_expressions or [], sort_keys=True),
             json.dumps(series_visibility or {}, sort_keys=True),
         ]
     )
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-# Cap on how many frames we evaluate. For typical timelines this means one
-# sample per frame; very long ranges fall back to this many evenly spaced
-# samples (still far denser than the display, so the envelope stays accurate).
+# Cap on how many frames are evaluated. For typical timelines that is one sample per
+# frame; very long ranges fall back to this many evenly spaced samples, still far denser
+# than the display, so the envelope stays accurate.
 _MAX_SAMPLES = 1500
 
 
@@ -236,7 +235,6 @@ _BRAILLE_DOTS = (
     (0x04, 0x20),
     (0x40, 0x80),
 )
-_BLOCKS = (" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
 
 
 _BRAILLE_BLANK = "⠀"   # blank braille cell: same advance width as filled cells
@@ -491,284 +489,33 @@ def render_stats_block(values, frames, frame_current, sample_count):
 # --------------------------------------------------------------------------- #
 # Optional RGBA image buffer (consumed by image_preview.py)
 # --------------------------------------------------------------------------- #
-try:
-    import numpy as _np
-except Exception:  # pragma: no cover - numpy ships with Blender
-    _np = None
+import numpy as _np
 
 _ZERO_LINE = (0.45, 0.45, 0.2, 1.0)
 _CURSOR_LINE = (0.95, 0.85, 0.25, 1.0)
-_LABEL_COLOR = (0.85, 0.90, 0.85, 1.0)
-
-# A 3x5 pixel font covering exactly the characters _format_value() can produce
-# ("-2.5", "1.87e+03", "0", ...), used to bake the min/mid/max guide values
-# directly into the graph image — the autoscaled shape alone can't tell the
-# viewer what those rows actually mean.
-_FONT_5PX = {
-    "0": ("###", "#.#", "#.#", "#.#", "###"),
-    "1": (".#.", "##.", ".#.", ".#.", "###"),
-    "2": ("###", "..#", "###", "#..", "###"),
-    "3": ("###", "..#", "###", "..#", "###"),
-    "4": ("#.#", "#.#", "###", "..#", "..#"),
-    "5": ("###", "#..", "###", "..#", "###"),
-    "6": ("###", "#..", "###", "#.#", "###"),
-    "7": ("###", "..#", "..#", "..#", "..#"),
-    "8": ("###", "#.#", "###", "#.#", "###"),
-    "9": ("###", "#.#", "###", "..#", "###"),
-    ".": ("...", "...", "...", "...", ".#."),
-    "-": ("...", "...", "###", "...", "..."),
-    "+": ("...", ".#.", "###", ".#.", "..."),
-    "e": ("...", "###", "#.#", "#..", "###"),
-    "A": (".#.", "#.#", "###", "#.#", "#.#"),
-    "B": ("##.", "#.#", "##.", "#.#", "##."),
-    "C": (".##", "#..", "#..", "#..", ".##"),
-    "D": ("##.", "#.#", "#.#", "#.#", "##."),
-    "E": ("###", "#..", "##.", "#..", "###"),
-    "F": ("###", "#..", "##.", "#..", "#.."),
-    "G": (".##", "#..", "#.#", "#.#", ".##"),
-    "H": ("#.#", "#.#", "###", "#.#", "#.#"),
-    "I": ("###", ".#.", ".#.", ".#.", "###"),
-    "J": ("..#", "..#", "..#", "#.#", ".#."),
-    "K": ("#.#", "#.#", "##.", "#.#", "#.#"),
-    "L": ("#..", "#..", "#..", "#..", "###"),
-    "M": ("#.#", "###", "###", "#.#", "#.#"),
-    "N": ("#.#", "###", "###", "###", "#.#"),
-    "O": (".#.", "#.#", "#.#", "#.#", ".#."),
-    "P": ("##.", "#.#", "##.", "#..", "#.."),
-    "Q": (".#.", "#.#", "#.#", ".##", "..#"),
-    "R": ("##.", "#.#", "##.", "#.#", "#.#"),
-    "S": (".##", "#..", ".#.", "..#", "##."),
-    "T": ("###", ".#.", ".#.", ".#.", ".#."),
-    "U": ("#.#", "#.#", "#.#", "#.#", ".#."),
-    "V": ("#.#", "#.#", "#.#", ".#.", ".#."),
-    "W": ("#.#", "#.#", "###", "###", "#.#"),
-    "X": ("#.#", "#.#", ".#.", "#.#", "#.#"),
-    "Y": ("#.#", "#.#", ".#.", ".#.", ".#."),
-    "Z": ("###", "..#", ".#.", "#..", "###"),
-    "?": ("##.", "..#", ".#.", "...", ".#."),
-    " ": ("...", "...", "...", "...", "..."),
-}
-_GLYPH_W, _GLYPH_H, _GLYPH_GAP = 3, 5, 1
-
-
-def _blit_text(pixels, width, height, x0, y_anchor, text, color,
-               glyph_h=_GLYPH_H, align="center", angle=0.0):
-    """Stamp ``text`` into a flat RGBA buffer (list or numpy array — both
-    support slice assignment), nearest-neighbour scaled to ``glyph_h`` pixels
-    tall (width follows the font's native aspect ratio). Integer block
-    scaling (1x/2x/3x) only offers 5/10/15px steps; this lets the caller pick
-    any in-between size, e.g. 7 or 8px. ``align`` controls how the glyph sits
-    relative to ``y_anchor``: "center" (for a mid-canvas guide), "top"
-    (anchor's row is the glyph's first row — for the very top guide, which
-    would otherwise be centered half off-canvas), or "bottom" (anchor's row
-    is the glyph's last row — same problem at the very bottom edge).
-    ``angle`` rotates the stamped word around its own centre, allowing the
-    typography preview to show turn amount without drawing a guide through
-    the readable text."""
-    glyph_h = max(_GLYPH_H, int(glyph_h))
-    glyph_w = max(_GLYPH_W, round(glyph_h * _GLYPH_W / _GLYPH_H))
-    gap = max(1, glyph_h // _GLYPH_H)
-    if align == "top":
-        y0 = int(y_anchor)
-    elif align == "bottom":
-        y0 = int(y_anchor) - glyph_h + 1
-    else:
-        y0 = int(y_anchor) - glyph_h // 2
-    x = int(x0)
-    text_width = max(0, len(text) * (glyph_w + gap) - gap)
-    centre_x = x + (text_width - 1) * .5
-    centre_y = y0 + (glyph_h - 1) * .5
-    cosine = math.cos(float(angle))
-    sine = math.sin(float(angle))
-    for char in text:
-        glyph = _FONT_5PX.get(char)
-        if glyph is None:
-            x += glyph_w + gap
-            continue
-        for out_row in range(glyph_h):
-            # The glyph table is authored top-down (row 0 = the character's
-            # top stroke), but the pixel buffer is bottom-to-top (increasing
-            # array row = higher on screen) — out_row 0 sits at y0 (the
-            # bottom of the glyph), so it must sample the font's LAST row.
-            src_row = _GLYPH_H - 1 - (out_row * _GLYPH_H // glyph_h)
-            bits = glyph[src_row]
-            y = y0 + out_row
-            for out_col in range(glyph_w):
-                src_col = out_col * _GLYPH_W // glyph_w
-                if bits[src_col] != "#":
-                    continue
-                px = x + out_col
-                if angle:
-                    dx = px - centre_x
-                    dy = y - centre_y
-                    px = int(round(centre_x + cosine * dx - sine * dy))
-                    py = int(round(centre_y + sine * dx + cosine * dy))
-                else:
-                    py = y
-                if not (0 <= px < width and 0 <= py < height):
-                    continue
-                base = (py * width + px) * 4
-                pixels[base:base + 4] = [color[0], color[1], color[2], color[3]]
-        x += glyph_w + gap
-
-
-def _preview_text_colour(base, response):
-    """Keep unrevealed units legible as guides while brightening live units."""
-    response = max(0.0, min(1.0, float(response)))
-    light = .18 + .82 * response
-    return tuple(channel * light for channel in base[:3]) + (1.0,)
-
-
-def _draw_axis_labels(pixels, width, height, minimum, maximum):
-    # Scale the font to the canvas so labels stay legible without dominating it.
-    glyph_h = max(_GLYPH_H, min(9, height // 30))
-    # The middle guide is ZERO whenever zero is on screen, not the arithmetic
-    # midpoint of the range. A curve running -46.9..80.1 put the labelled middle
-    # at 16.63, which reads as a baseline and is not one - the eye takes the
-    # centre line as "no change". Only when the data never crosses zero does the
-    # midpoint get the label, because then there is no zero to show.
-    span = maximum - minimum
-    if minimum < 0 < maximum and span > 1e-12:
-        mid = 0.0
-        mid_row = int(round((0.0 - minimum) / span * (height - 1)))
-    else:
-        mid = (minimum + maximum) / 2
-        mid_row = height // 2
-    # The pixel buffer is stored bottom-to-top (see render_image_pixels'
-    # docstring / to_y: minimum maps to row 0, maximum to row height-1) — so
-    # row 0 is the BOTTOM of the displayed image and gets the minimum label,
-    # not the maximum. "top"/"bottom" below are array-bounds alignment (which
-    # way the glyph safely extends from its anchor row), not display position.
-    labels = (
-        (minimum, 0, "top"),
-        (mid, mid_row, "center"),
-        (maximum, height - 1, "bottom"),
-    )
-    for value, gy, align in labels:
-        _blit_text(pixels, width, height, 2, gy, _format_value(value), _LABEL_COLOR, glyph_h=glyph_h, align=align)
-
-
 _CLAMP_LINE = (1.0, 0.55, 0.15, 1.0)
-
-
-def _weighted_preview_index(index, weights):
-    weights = [max(0.0, float(value)) for value in (weights or (1.0,))]
-    total = sum(weights)
-    if total <= 1e-12:
-        return 0
-    unit = (math.sin(index * 12.9898) * 43758.5453) % 1.0
-    choice = unit * total
-    cumulative = 0.0
-    for source_index, weight in enumerate(weights):
-        cumulative += weight
-        if weight > 0.0 and choice < cumulative:
-            return source_index
-    return len(weights) - 1
-
-
-def render_showcase_grid_pixels(values, *, frame=1.0, source_weights=(1.0,),
-                                width=224, height=224,
-                                bg=(0.10, 0.10, 0.12, 1.0)):
-    """Render a small spatial presentation of Kinetic Wave before apply.
-
-    Placement mirrors the generated grid; glyph family identifies which source
-    the deterministic mix selects, while size and brightness show the current
-    travelling-wave response. This is intentionally a presentation rather than
-    a numerical graph: exact values remain available in the normal preview.
-    """
-    values = dict(values or {})
-    columns = max(1, int(values.get("COLUMNS", 8)))
-    rows = max(1, int(values.get("ROWS", 5)))
-    duration = max(1e-6, float(values.get("DURATION", 48.0)))
-    wavelength = max(1e-6, float(values.get("WAVELENGTH", 4.0)))
-    scale_min = max(0.0, float(values.get("SCALE_MIN", 0.35)))
-    scale_max = max(scale_min, float(values.get("SCALE_MAX", 1.25)))
-    falloff = max(0.05, float(values.get("FALLOFF", 1.5)))
-    phase_offset = float(values.get("PHASE", 0.0))
-    direction = -1.0 if bool(values.get("REVERSE", 0)) else 1.0
-    centre_x = float(values.get("CENTRE_X", 0.0))
-    centre_y = float(values.get("CENTRE_Y", 0.0))
-    spacing_x = max(0.001, float(values.get("SPACING_X", 2.0)))
-    spacing_y = max(0.001, float(values.get("SPACING_Y", 2.0)))
-    if _np is not None:
-        image = _np.empty((height, width, 4), dtype=_np.float32)
-        image[:] = bg
-        pixels = image.reshape(-1)
-    else:
-        pixels = list(bg) * (width * height)
-
-    pad = max(8, min(width, height) // 12)
-    cell_w = (width - pad * 2) / max(1, columns)
-    cell_h = (height - pad * 2) / max(1, rows)
-    base_radius = max(2.0, min(cell_w, cell_h) * 0.28)
-    palette = (
-        (0.20, 0.76, 1.00, 1.0),
-        (1.00, 0.48, 0.20, 1.0),
-        (0.45, 1.00, 0.48, 1.0),
-        (0.82, 0.42, 1.00, 1.0),
-        (1.00, 0.84, 0.22, 1.0),
-    )
-
-    def put(px, py, colour):
-        if 0 <= px < width and 0 <= py < height:
-            offset = (py * width + px) * 4
-            pixels[offset:offset + 4] = colour
-
-    for row in range(rows):
-        for column in range(columns):
-            index = row * columns + column
-            world_x = (column - (columns - 1) * 0.5) * spacing_x
-            world_y = (row - (rows - 1) * 0.5) * spacing_y
-            distance = math.hypot(world_x - centre_x, world_y - centre_y)
-            phase = distance / wavelength * math.tau - (float(frame) + phase_offset) * direction / duration * math.tau
-            response = max(0.0, (0.5 + 0.5 * math.sin(phase))) ** falloff
-            scale = scale_min + (scale_max - scale_min) * response
-            radius = max(1, int(round(base_radius * max(0.25, scale))))
-            source_index = _weighted_preview_index(index, source_weights)
-            base = palette[source_index % len(palette)]
-            light = 0.42 + 0.58 * response
-            colour = (base[0] * light, base[1] * light, base[2] * light, 1.0)
-            cx = int(round(pad + (column + 0.5) * cell_w))
-            cy = int(round(pad + (row + 0.5) * cell_h))
-            glyph = source_index % 3
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    if glyph == 0:
-                        inside = dx * dx + dy * dy <= radius * radius
-                    elif glyph == 1:
-                        inside = max(abs(dx), abs(dy)) <= radius
-                    else:
-                        inside = abs(dx) + abs(dy) <= radius
-                    if inside:
-                        put(cx + dx, cy + dy, colour)
-    return pixels, (width, height)
 
 
 def render_image_pixels(values, width=200, height=200, style="LINE",
                         bg=(0.10, 0.10, 0.12, 1.0), line=(0.30, 0.75, 1.0, 1.0),
                         guide=(0.32, 0.32, 0.36, 1.0),
                         frame_start=1.0, frame_end=250.0, frame_current=None,
-                        show_axis_labels=False, scale=None, marks=(),
-                        colour_strip=()):
+                        scale=None, marks=()):
     """Render the expression as an accurate RGBA pixel graph.
 
     Returns ``(pixels, (width, height))`` where ``pixels`` is a flat RGBA buffer
-    ordered bottom-to-top (a numpy float32 array when numpy is available, which
-    uploads via ``foreach_set`` far faster; otherwise a Python list). Every pixel
+    ordered bottom-to-top (a numpy float32 array, which uploads via
+    ``foreach_set`` far faster than a list). Every pixel
     column reports the min-max envelope of the frames inside it, so every
     pulse/beat is drawn regardless of width. ``style`` picks the chart shape.
 
     The Y axis always autoscales to the sampled values' own min/max, so the
     shape fills the frame regardless of the expression's actual magnitude.
-    ``show_axis_labels`` bakes the min/mid/max values into the image so the
-    guide rows mean something without reading a separate caption.
     """
     if not values:
-        if _np is not None:
-            img = _np.empty((height, width, 4), dtype=_np.float32)
-            img[:] = bg
-            return img.reshape(-1), (width, height)
-        return list(bg) * (width * height), (width, height)
+        img = _np.empty((height, width, 4), dtype=_np.float32)
+        img[:] = bg
+        return img.reshape(-1), (width, height)
 
     if scale is not None:
         minimum, maximum = float(scale[0]), float(scale[1])
@@ -776,56 +523,20 @@ def render_image_pixels(values, width=200, height=200, style="LINE",
         # pushes against the top/bottom edge instead of the box rescaling.
         values = [min(maximum, max(minimum, float(v))) for v in values]
     else:
-        # Auto-fit ALWAYS includes zero, so the curve is read in absolute terms.
-        # Fitting to the data alone magnified a hair-thin wiggle to full height:
-        # a value moving 5.3233 -> 5.3240 drew as a dramatic diagonal, and all
-        # three axis labels rounded to "5.32". Anchoring to zero shows that for
-        # what it is - a near-flat line sitting up at 5.32 - and makes two
-        # templates comparable, because they are drawn against the same floor.
+        # Auto-fit always includes zero, so the curve is read in absolute terms. Fitting
+        # to the data alone would magnify a hair-thin wiggle to full height (a value
+        # moving 5.3233 to 5.3240 would draw as a dramatic diagonal, with all three axis
+        # labels rounding to "5.32"). Anchoring to zero shows it as a near-flat line
+        # sitting up at 5.32 and makes two templates comparable, since they are drawn
+        # against the same floor.
         minimum = min(0.0, float(min(values)))
         maximum = max(0.0, float(max(values)))
         if maximum - minimum <= 1e-12:
             # A genuinely constant zero still needs a band to draw into.
             minimum, maximum = -1.0, 1.0
 
-    if _np is not None:
-        pixels, size = _render_image_numpy(values, width, height, style, bg, line, guide, marks,
-                                           frame_start, frame_end, frame_current, minimum, maximum)
-    else:
-        pixels, size = _render_image_python(values, width, height, style, bg, line, guide, marks,
-                                            frame_start, frame_end, frame_current, minimum, maximum)
-    if show_axis_labels:
-        _draw_axis_labels(pixels, width, height, minimum, maximum)
-    if colour_strip:
-        _draw_colour_strip(pixels, width, height, colour_strip)
-    return pixels, size
-
-
-def _draw_colour_strip(pixels, width, height, colours):
-    """Draw the evaluated ColorRamp result as a compact band in the graph."""
-    if not colours or width < 12 or height < 12:
-        return
-    x0, x1 = min(34, width // 4), width - 4
-    y0, y1 = 6, min(height - 4, 18)
-    count = len(colours)
-
-    def put(x, y, colour):
-        index = (y * width + x) * 4
-        pixels[index:index + 4] = colour
-
-    border = (0.55, 0.55, 0.58, 1.0)
-    for x in range(x0 - 1, x1 + 1):
-        put(x, y0 - 1, border)
-        put(x, y1, border)
-    for y in range(y0 - 1, y1 + 1):
-        put(x0 - 1, y, border)
-        put(x1, y, border)
-    span = max(1, x1 - x0)
-    for x in range(x0, x1):
-        sample = min(count - 1, int((x - x0) * count / span))
-        colour = tuple(colours[sample])
-        for y in range(y0, y1):
-            put(x, y, colour)
+    return _render_image_numpy(values, width, height, style, bg, line, guide, marks,
+                               frame_start, frame_end, frame_current, minimum, maximum)
 
 
 def _render_image_numpy(values, width, height, style, bg, line, guide, marks,
@@ -857,10 +568,9 @@ def _render_image_numpy(values, width, height, style, bg, line, guide, marks,
         img[gy, ::3] = guide
     if zero_y is not None:
         img[zero_y, :] = _ZERO_LINE
-    # Clamp limits, drawn where the curve actually meets them. The curve itself
-    # is NOT moved to fit between them: shifting it made the shape readable at
-    # the cost of showing it at a height the values never occupy. Lines say the
-    # same thing without lying about the values.
+    # Clamp limits, drawn where the curve meets them. The curve itself is not moved to
+    # fit between them, since that would show the shape at a height the values never
+    # occupy; lines say the same thing without misrepresenting the values.
     for mark in (marks or ()):
         try:
             if minimum <= float(mark) <= maximum:
@@ -909,86 +619,6 @@ def _render_image_numpy(values, width, height, style, bg, line, guide, marks,
     return img.reshape(-1), (width, height)
 
 
-def _render_image_python(values, width, height, style, bg, line, guide, marks,
-                         frame_start, frame_end, frame_current, minimum, maximum):
-    pix = list(bg) * (width * height)
-
-    def put(x, y, color):
-        if 0 <= x < width and 0 <= y < height:
-            base = (y * width + x) * 4
-            pix[base:base + 4] = [color[0], color[1], color[2], color[3]]
-
-    def vline(x, y0, y1, color):
-        for y in range(max(0, min(y0, y1)), min(height - 1, max(y0, y1)) + 1):
-            base = (y * width + x) * 4
-            pix[base:base + 4] = [color[0], color[1], color[2], color[3]]
-
-    columns = _column_envelopes(values, width)
-    span = maximum - minimum
-
-    def to_y(value):
-        norm = 0.5 if span <= 1e-12 else (value - minimum) / span
-        return int(round(min(1.0, max(0.0, norm)) * (height - 1)))
-
-    # Horizontal guides: min, middle (zero when visible), max.
-    zero_y = to_y(0.0) if minimum < 0 < maximum else None
-    for gy in (0, zero_y if zero_y is not None else height // 2, height - 1):
-        for x in range(0, width, 3):
-            put(x, gy, guide)
-    if zero_y is not None:
-        for x in range(width):
-            put(x, zero_y, _ZERO_LINE)
-    # Clamp limits - see the numpy renderer for why the curve is not moved.
-    for mark in (marks or ()):
-        try:
-            value = float(mark)
-        except (TypeError, ValueError):
-            continue
-        if minimum <= value <= maximum:
-            my = to_y(value)
-            for x in range(0, width, 2):
-                put(x, my, _CLAMP_LINE)
-
-    baseline = zero_y if zero_y is not None else 0
-    if style == "MIRROR":
-        center = 0.0 if minimum < 0 < maximum else (minimum + maximum) / 2
-        center_y = to_y(center)
-        for x in range(width):
-            low, high = columns[x]
-            vline(x, min(to_y(low), center_y), max(to_y(high), center_y), line)
-    elif style == "BARS":
-        # Discrete bars, each the max over its frame span so no pulse is skipped.
-        body, gap = 4, 2
-        period = body + gap
-        bar_count = max(1, width // period)
-        for index, (_low, high) in enumerate(_column_envelopes(values, bar_count)):
-            top = to_y(high)
-            x0 = index * period
-            for x in range(x0, min(width, x0 + body)):
-                vline(x, baseline, top, line)
-    elif style == "FILLED":
-        for x in range(width):
-            _low, high = columns[x]
-            vline(x, baseline, to_y(high), line)
-    else:  # LINE
-        prev_lo = prev_hi = None
-        for x in range(width):
-            low, high = columns[x]
-            lo_y, hi_y = to_y(low), to_y(high)
-            vline(x, lo_y, hi_y, line)
-            if prev_lo is not None:  # bridge gaps so the curve stays connected
-                vline(x, prev_lo, lo_y, line)
-                vline(x, prev_hi, hi_y, line)
-            prev_lo, prev_hi = lo_y, hi_y
-
-    # Current-frame cursor on top.
-    cursor_col = _cursor_column(width, frame_start, frame_end, frame_current)
-    if cursor_col is not None:
-        for y in range(0, height, 3):
-            put(cursor_col, y, (0.95, 0.85, 0.25, 1.0))
-    return pix, (width, height)
-
-
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
@@ -1012,7 +642,7 @@ def _finalize_preview_result(
     scale=None, zoom=1.0, want_text=True,
 ):
     """Build a PreviewResult from a cached samples dict. Shared by
-    sample_preview (template-expression eval) and sample_fcurve_driver
+    sample_preview (the template's own expression) and sample_fcurve_driver
     (real fcurve.evaluate()) so both data sources render through the exact
     same renderers/styles/detail-line logic."""
     style = style if style in VALID_STYLES else "LINE"
@@ -1072,10 +702,7 @@ def default_reference_range(
     """Vertical (min, max) for the active channel's default-scale motion.
 
     Amplitude values stay at catalogue defaults so Fixed Scale remains stable,
-    but structural selectors follow the current configuration. For example,
-    Ball Bounce's Drop Height chooses between a downward drop and an upward
-    in-place launch; those modes cannot honestly share one reference range.
-    Multi-channel templates likewise use the selected channel instead of always
+    Multi-channel templates use the selected channel instead of always
     inheriting channel zero's units and bounds.
 
     One-sided ranges keep their real boundary while adding headroom away from
@@ -1083,15 +710,6 @@ def default_reference_range(
     Returns None when the selected default output is flat.
     """
     values = {p["token"]: p.get("default") for p in template.get("params", [])}
-    if current_values:
-        structural_tokens = set()
-        for param in template.get("params", []):
-            structural_tokens.update((param.get("visible_if") or {}).keys())
-        for channel in template.get("channels", []):
-            structural_tokens.update((channel.get("enabled_if") or {}).keys())
-        for token in structural_tokens:
-            if token in current_values:
-                values[token] = current_values[token]
     if any(not isinstance(v, (int, float)) or isinstance(v, bool) for v in values.values()):
         return None
     try:
@@ -1103,12 +721,10 @@ def default_reference_range(
         if channel is None:
             return None
         expr = channel["expression"]
-        helper_expressions = channel.get("internal_helpers")
     except Exception:
         return None
     ref = sample_preview(
         str(expr), template, frame_start, frame_end, None, None, False, "LINE",
-        helper_expressions=helper_expressions,
     )
     if not ref.valid:
         return None
@@ -1128,8 +744,7 @@ def default_reference_range(
 
 def sample_preview(expression, template, frame_start, frame_end, sample_count=None,
                    frame_current=None, detailed=False, style="LINE", scale=None,
-                   zoom=1.0, want_text=True, helper_expressions=None,
-                   series_visibility=None):
+                   zoom=1.0, want_text=True, series_visibility=None):
     # Sample density is automatic (per frame, capped): a fixed, predictable basis
     # so the preview never aliases as a user-tweakable count would.
     if sample_count is None:
@@ -1138,7 +753,6 @@ def sample_preview(expression, template, frame_start, frame_end, sample_count=No
         sample_count = max(2, min(_MAX_SAMPLES, int(sample_count)))
     cache_key = _make_cache_key(
         expression, template, frame_start, frame_end, sample_count,
-        helper_expressions=helper_expressions,
         series_visibility=series_visibility,
     )
 
@@ -1146,7 +760,6 @@ def sample_preview(expression, template, frame_start, frame_end, sample_count=No
     if cached is None:
         cached = _compute_samples(
             expression, template, frame_start, frame_end, sample_count, cache_key,
-            helper_expressions=helper_expressions,
         )
         _CACHE[cache_key] = cached
 
@@ -1156,7 +769,8 @@ def sample_preview(expression, template, frame_start, frame_end, sample_count=No
     )
 
 
-def _make_fcurve_cache_key(owner_name, data_path, array_index, expression, frame_start, frame_end, sample_count):
+def _make_fcurve_cache_key(owner_name, data_path, array_index, expression, frame_start, frame_end, sample_count,
+                           variable_values=()):
     raw = "|".join(
         [
             "fcurve",
@@ -1164,6 +778,7 @@ def _make_fcurve_cache_key(owner_name, data_path, array_index, expression, frame
             data_path,
             str(array_index),
             expression,
+            repr(variable_values),
             format(float(frame_start), ".9g"),
             format(float(frame_end), ".9g"),
             str(int(sample_count)),
@@ -1172,12 +787,183 @@ def _make_fcurve_cache_key(owner_name, data_path, array_index, expression, frame
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def _compute_fcurve_samples(fcurve, frame_start, frame_end, sample_count):
+def _COMPILE(expression):
+    return formula_reader.parse(expression)
+
+
+def _RUN(code, namespace):
+    return float(code(namespace))
+
+
+_TRANSFORM_AXES = {"X": 0, "Y": 1, "Z": 2}
+_MAX_DRIVEN_DEPTH = 8
+
+
+class _Driven:
+    """A variable whose source property is itself driven (a helper chain).
+
+    Its value depends on the frame, so it is evaluated per frame from the driver
+    that produces it; reading the property once would draw a flat line.
+    """
+
+    def __init__(self, driver, depth, trail):
+        if depth > _MAX_DRIVEN_DEPTH or driver.as_pointer() in trail:
+            raise ValueError("drivers feed each other in a loop")
+        self.driver = driver
+        self.type = driver.type
+        self.expression = driver.expression
+        self.code = _COMPILE(driver.expression) if driver.type == "SCRIPTED" else None
+        self.sources = _driver_variable_values(driver, depth + 1, trail | {driver.as_pointer()})
+
+    def __repr__(self):
+        return "Driven(%s,%s,%r)" % (self.type, self.expression, self.sources)
+
+    def at(self, frame):
+        return _driver_value_at(self, self.code, _resolved(self.sources, frame), frame)
+
+
+class _Keyed:
+    """A variable whose source property is keyframed (a sampled helper): read per frame from its curve."""
+
+    def __init__(self, curve):
+        self.curve = curve
+        points = tuple((round(p.co[0], 4), round(p.co[1], 6)) for p in curve.keyframe_points)
+        self.signature = (curve.data_path, len(points), points[:1], points[-1:], hash(points))
+
+    def __repr__(self):
+        return "Keyed%r" % (self.signature,)
+
+    def at(self, frame):
+        return float(self.curve.evaluate(frame))
+
+
+def _resolved(sources, frame):
+    return tuple((name, source.at(frame) if isinstance(source, (_Driven, _Keyed)) else source)
+                 for name, source in sources)
+
+
+def _keyed_curve(block, data_path):
+    """The F-curve in ``block``'s Action that animates ``data_path``, or None."""
+    animation = getattr(block, "animation_data", None)
+    action = getattr(animation, "action", None)
+    if action is None:
+        return None
+    from ...generated.resources import animation as generated_animation
+
+    for _container, curve in generated_animation.action_containers(action):
+        if curve.data_path == data_path and curve.array_index == 0 and len(curve.keyframe_points) > 1:
+            return curve
+    return None
+
+
+def _driving_curve(block, data_path):
+    """The F-curve driving ``block.<data_path>``, or None when nothing drives it."""
+    animation = getattr(block, "animation_data", None)
+    if animation is None:
+        return None
+    path, index = data_path, -1
+    if data_path.endswith("]") and data_path.rsplit("[", 1)[-1][:-1].isdigit():
+        path, index = data_path.rsplit("[", 1)[0], int(data_path.rsplit("[", 1)[-1][:-1])
+    curve = animation.drivers.find(path, index=index) if index >= 0 else animation.drivers.find(path)
+    return curve
+
+
+def _driver_variable_value(variable, depth=0, trail=frozenset()):
+    """The number one driver variable currently reads, or the driver that produces it.
+
+    Blender evaluates drivers only inside its dependency graph, and
+    ``FCurve.evaluate`` on a driver curve just maps time through the curve's
+    own keys, so it answers with the frame number, not with the driver's
+    result. The variables are therefore read here the way the driver reads them.
+    """
+    target = variable.targets[0]
+    block = target.id
+    if block is None:
+        raise ValueError("variable '%s' has no target" % variable.name)
+    if variable.type == "SINGLE_PROP":
+        curve = _driving_curve(block, target.data_path)
+        if curve is not None and curve.driver is not None:
+            return _Driven(curve.driver, depth, trail)
+        keyed = _keyed_curve(block, target.data_path)
+        if keyed is not None:
+            return _Keyed(keyed)
+        value = block.path_resolve(target.data_path)
+        try:
+            return float(value)
+        except TypeError:
+            return float(value[0])
+    if variable.type == "TRANSFORMS" and hasattr(block, "matrix_world"):
+        kind, axis = (target.transform_type or "LOC_X").rsplit("_", 1)
+        index = _TRANSFORM_AXES[axis]
+        if kind == "LOC":
+            return float(block.matrix_world.translation[index] if target.transform_space == "WORLD_SPACE"
+                         else block.location[index])
+        if kind == "ROT":
+            return float(block.matrix_world.to_euler()[index] if target.transform_space == "WORLD_SPACE"
+                         else block.rotation_euler[index])
+        return float(block.matrix_world.to_scale()[index] if target.transform_space == "WORLD_SPACE"
+                     else block.scale[index])
+    raise ValueError("%s variables" % variable.type.lower().replace("_", " "))
+
+
+def _driver_variable_values(driver, depth=0, trail=frozenset()):
+    return tuple((variable.name, _driver_variable_value(variable, depth, trail)) for variable in driver.variables)
+
+
+_SELF_PATHS = {"LOC": "location", "ROT": "rotation_euler", "SCALE": "scale"}
+
+
+def _reject_self_reads(fcurve):
+    """A driver that reads the very property it drives has no curve to draw.
+
+    Blender breaks that loop with the previous evaluation, so the value it
+    reads depends on playback order; the number read here would be one point
+    of that, not the curve.
+    """
+    owner = fcurve.id_data
+    for variable in fcurve.driver.variables:
+        target = variable.targets[0]
+        if target.id is None or target.id != owner:
+            continue
+        if variable.type == "TRANSFORMS":
+            kind = (target.transform_type or "LOC_X").rsplit("_", 1)[0]
+            same = fcurve.data_path == _SELF_PATHS.get(kind)
+        elif variable.type == "SINGLE_PROP":
+            same = target.data_path in (fcurve.data_path, "%s[%d]" % (fcurve.data_path, fcurve.array_index))
+        else:
+            same = False
+        if same:
+            raise ValueError("it reads the property it drives")
+
+
+def _driver_value_at(driver, code, variable_values, frame):
+    """What the driver outputs at ``frame``, given the variables' values."""
+    if driver.type == "SCRIPTED":
+        namespace = dict(utils.SAFE_NAMESPACE)
+        namespace.update(dict(variable_values))
+        namespace["frame"] = frame
+        return _RUN(code, namespace)
+    numbers = [value for _name, value in variable_values]
+    if not numbers:
+        return 0.0
+    return {
+        "SUM": sum(numbers),
+        "AVERAGE": sum(numbers) / len(numbers),
+        "MIN": min(numbers),
+        "MAX": max(numbers),
+    }[driver.type]
+
+
+def _compute_fcurve_samples(fcurve, frame_start, frame_end, sample_count, variable_values=None):
     frames = _sample_frames(float(frame_start), float(frame_end), sample_count)
     values = []
     try:
+        driver = fcurve.driver
+        if variable_values is None:
+            variable_values = _driver_variable_values(driver)
+        code = _COMPILE(driver.expression) if driver.type == "SCRIPTED" else None
         for frame in frames:
-            value = float(fcurve.evaluate(frame))
+            value = _driver_value_at(driver, code, _resolved(variable_values, frame), frame)
             if not math.isfinite(value):
                 raise ValueError(f"non-finite value at frame {frame:g}")
             values.append(value)
@@ -1200,9 +986,8 @@ def _compute_fcurve_samples(fcurve, frame_start, frame_end, sample_count):
 def sample_fcurve_driver(fcurve, owner_name, data_path, array_index, frame_start, frame_end,
                           sample_count=None, frame_current=None, detailed=False, style="LINE",
                           scale=None, zoom=1.0, want_text=True):
-    """Sample a real, already-applied driver via Blender's own
-    FCurve.evaluate(), which correctly resolves that driver's actual
-    variables — no sandboxed-eval reimplementation needed. Mirrors
+    """Sample a real, already-applied driver: its own expression, evaluated over
+    the frame range with the variables it currently reads. Mirrors
     sample_preview()'s PreviewResult shape and shares its cache/renderers so
     the Preview panel can display either data source identically."""
     if sample_count is None:
@@ -1211,18 +996,28 @@ def sample_fcurve_driver(fcurve, owner_name, data_path, array_index, frame_start
         sample_count = max(2, min(_MAX_SAMPLES, int(sample_count)))
 
     expression = getattr(getattr(fcurve, "driver", None), "expression", "")
-    cache_key = _make_fcurve_cache_key(owner_name, data_path, array_index, expression, frame_start, frame_end, sample_count)
+    try:
+        _reject_self_reads(fcurve)
+        variable_values = _driver_variable_values(fcurve.driver)
+    except Exception as exc:
+        failed = {"valid": False, "message": "Preview unavailable: " + str(exc)}
+        return _finalize_preview_result(
+            failed, "", style, frame_current, detailed, sample_count,
+            scale=scale, zoom=zoom, want_text=want_text,
+        )
+    cache_key = _make_fcurve_cache_key(
+        owner_name, data_path, array_index, expression, frame_start, frame_end, sample_count, variable_values,
+    )
 
     cached = _CACHE.get(cache_key)
     if cached is None:
-        cached = _compute_fcurve_samples(fcurve, frame_start, frame_end, sample_count)
+        cached = _compute_fcurve_samples(fcurve, frame_start, frame_end, sample_count, variable_values)
         _CACHE[cache_key] = cached
 
     return _finalize_preview_result(
         cached, cache_key, style, frame_current, detailed, sample_count,
         scale=scale, zoom=zoom, want_text=want_text,
     )
-
 
 
 # Evaluating every frame of a very long scene is not free, so the peak-preserving
@@ -1233,13 +1028,12 @@ _MAX_EVALUATED_FRAMES = 20000
 
 
 def _peak_preserving_frames(frame_start, frame_end, sample_count):
-    """Every frame, when there are more frames than samples - else None.
+    """Every frame, when there are more frames than samples; otherwise None.
 
-    One sample per frame stops a narrow pulse falling between samples, but only
-    while the scene is shorter than the sample cap. Past that the spacing
-    exceeds a frame and pulses start disappearing outright: measured on a
-    5000-frame scene, the blink template fired 52 times and the graph drew 43.
-    The nine that vanished were not faint, they were absent.
+    One sample per frame stops a narrow pulse falling between samples, but only while
+    the scene is shorter than the sample cap. Past that the spacing exceeds a frame and
+    pulses start disappearing outright: on a 5000-frame scene a blink template fires 52
+    times and a spaced graph would show 43.
     """
     span = abs(frame_end - frame_start)
     total = int(round(span)) + 1
@@ -1272,45 +1066,27 @@ def _reduce_to_extremes(frames, values, sample_count):
 
 def _compute_samples(
     expression, template, frame_start, frame_end, sample_count, cache_key,
-    helper_expressions=None,
 ):
     valid, message = utils.validate_expression(expression, template, None)
     if not valid:
         return {"valid": False, "message": "Preview unavailable: " + message}
     try:
-        code = compile(expression, "<driver_espresso_preview>", "eval")
+        code = formula_reader.parse(expression)
     except SyntaxError as exc:
         return {"valid": False, "message": "Preview unavailable: " + exc.msg}
+    except ValueError as exc:
+        return {"valid": False, "message": "Preview unavailable: " + str(exc)}
 
     namespace = dict(utils.SAFE_NAMESPACE)
-    for variable in (
-        *template.get("requires_driver_variables", []),
-        *template.get("managed_driver_variables", []),
-    ):
+    for variable in template.get("requires_driver_variables", []):
         namespace[variable["name"]] = variable.get("preview_default", 0)
-    # A helper may carry no expression -- its real value only exists once the
-    # rig is built -- in which case it contributes its declared preview number.
-    # Indexing "expression" unconditionally turned that into a KeyError that
-    # took the whole preview panel down rather than drawing a curve.
-    helper_codes = []
-    for item in (helper_expressions or []):
-        expression = item.get("expression")
-        if not expression:
-            expression = repr(float(item.get("preview_default", 0.0) or 0.0))
-        helper_codes.append((
-            item["name"],
-            compile(expression, "<driver_espresso_helper_preview>", "eval"),
-        ))
-
     dense_frames = _peak_preserving_frames(float(frame_start), float(frame_end), sample_count)
     frames = dense_frames or _sample_frames(float(frame_start), float(frame_end), sample_count)
     values = []
     try:
         for frame in frames:
             namespace["frame"] = frame
-            for name, helper_code in helper_codes:
-                namespace[name] = eval(helper_code, {"__builtins__": {}}, namespace)
-            value = eval(code, {"__builtins__": {}}, namespace)
+            value = code(namespace)
             if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                 raise ValueError(f"non-numeric value at frame {frame:g}")
             values.append(float(value))
@@ -1383,25 +1159,18 @@ def cursor_column_for(width, frame_start, frame_end, frame_current):
 
 
 def stamp_cursor(pixels, width, height, column):
-    """Return a COPY of ``pixels`` with the playhead column drawn on it.
+    """Return a copy of ``pixels`` with the playhead column drawn on it.
 
     Split out of the renderer so playback can redraw the moving cursor without
-    re-running the curve maths. The curve, guides, clamp marks and axis labels
-    are frame-independent, so they are rendered once and this stamps the only
-    part that moves - measured as the difference between a full 224x224
-    re-render per frame and a buffer copy plus one column write.
-
-    A copy, never in-place: the caller keeps the cursorless buffer cached, and
-    stamping into it would leave a trail of every previous playhead position.
+    re-running the curve maths. The curve, guides, clamp marks and axis labels are
+    frame-independent, so they are rendered once and this stamps the only part that
+    moves: a buffer copy plus one column write instead of a full 224x224 re-render per
+    frame. It returns a copy, never an in-place edit, because the caller keeps the
+    cursorless buffer cached and stamping into it would leave a trail of every previous
+    playhead position.
     """
     if column is None:
         return pixels
-    if _np is not None and hasattr(pixels, "reshape"):
-        img = pixels.reshape((height, width, 4)).copy()
-        img[::3, column] = _CURSOR_LINE
-        return img.reshape(-1)
-    out = list(pixels)
-    for y in range(0, height, 3):
-        base = (y * width + column) * 4
-        out[base:base + 4] = list(_CURSOR_LINE)
-    return out
+    img = pixels.reshape((height, width, 4)).copy()
+    img[::3, column] = _CURSOR_LINE
+    return img.reshape(-1)

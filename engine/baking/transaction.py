@@ -1,5 +1,5 @@
 """One rollback boundary for apply, key writing, and bake cleanup."""
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from functools import wraps
 from types import SimpleNamespace
 
@@ -18,7 +18,7 @@ def _snapshot_holding_user_pointers(snapshot):
     copies = [
         item['copy']
         for entries in (snapshot._objects, snapshot._data_copies,
-                        snapshot._collections, snapshot._node_groups)
+                        snapshot._node_groups)
         for item in entries
     ]
     copies.extend(item['graph_copy'] for item in snapshot._ids if 'graph_copy' in item)
@@ -85,10 +85,10 @@ def _restore_target_values(captured):
         if index >= 0:
             owner.path_resolve(path)[index] = value
         elif path.endswith(']'):
-            import ast
+            from ..expression import formula_reader
             prefix, _separator, key = path.rpartition('[')
             container = owner.path_resolve(prefix) if prefix else owner
-            container[ast.literal_eval(key[:-1])] = value
+            container[formula_reader.literal(formula_reader.parse_expression(key[:-1]))] = value
         else:
             prefix, _separator, attribute = path.rpartition('.')
             container = owner.path_resolve(prefix) if prefix else owner
@@ -152,10 +152,10 @@ def _restore_action(action, state):
             action.slots.remove(slot)
 
 
-def _selected_motion_channels(context, template, bone=None):
+def _selected_motion_channels(context, template):
+    """The template's channels the artist has not switched off."""
     from ...catalogue import templates
     from ...ui.state import props as espresso_props
-    from ...apply.motion import motion_channels
 
     channels = templates.template_channels(template)
     enabled = espresso_props.enabled_channel_ids_for_template(
@@ -163,47 +163,7 @@ def _selected_motion_channels(context, template, bone=None):
     )
     if enabled is not None:
         channels = [channel for channel in channels if channel.get('id') in enabled]
-    if not channels:
-        return []
-    if bone is not None:
-        selected_template = dict(template, channels=channels)
-        return motion_channels.effective_channels(selected_template, bone)
     return channels
-
-
-def _planned_apply_targets(context):
-    """Resolve the selected recipe's existing Blender destinations before Apply."""
-    from ...catalogue import templates
-    from ...ui.state import props as espresso_props
-    from ...apply.motion import motion_channels
-
-    obj = context.active_object
-    template = espresso_props.get_current_template(context.scene.espresso_props)
-    kind = str((template.get('application_target') or {}).get('kind') or '')
-    scalar = {
-        'CAMERA_LENS': (obj.data, 'lens'),
-        'CAMERA_SHIFT_X': (obj.data, 'shift_x'),
-        'CAMERA_SHIFT_Y': (obj.data, 'shift_y'),
-        'CAMERA_FOCUS_DISTANCE': (obj.data, 'dof.focus_distance'),
-        'SCENE_EXPOSURE': (context.scene, 'view_settings.exposure'),
-    } if obj is not None and obj.type == 'CAMERA' else {}
-    if kind in scalar:
-        owner, path = scalar[kind]
-        return [SimpleNamespace(owner=owner, data_path=path, index=-1)]
-    if kind == 'CAMERA_FORWARD_DOLLY' and obj is not None:
-        return [SimpleNamespace(owner=obj, data_path='location', index=index)
-                for index in range(3)]
-    if templates.has_motion_plan(template) and obj is not None:
-        bone = context.active_pose_bone if context.mode == 'POSE' else None
-        channels = _selected_motion_channels(context, template, bone)
-        if bone is not None:
-            return motion_channels.motion_targets_for_bone(
-                obj, bone, template, channels=channels,
-            )
-        return motion_channels.motion_targets_for_object(
-            obj, template, channels=channels,
-        )
-    raise RuntimeError('The selected template has no bakeable destination.')
 
 
 @contextmanager
@@ -214,7 +174,7 @@ def bake_transaction(context, *, targets=(), objects=(), chosen=()):
         yield
         return
     from . import bake
-    from ...apply import applied_motion, internal_helpers
+    from ...apply import applied_motion
     from ...ui.actions import bake_applied
     from ...generated.resources import clear_snapshot
 
@@ -239,12 +199,9 @@ def bake_transaction(context, *, targets=(), objects=(), chosen=()):
         add(world)
         add(world.node_tree)
     add(getattr(context.scene, 'compositing_node_group', None))
-    # Driver dependencies are the ownership map for private helper properties.
+    # Driver variable targets are the datablocks a driver depends on.
     for owner in owners:
         for curve in getattr(getattr(owner, 'animation_data', None), 'drivers', ()) or ():
-            for resource in internal_helpers.resources_from_driver(curve.driver):
-                helper = resource[0] if isinstance(resource, (tuple, list)) else None
-                add(helper)
             for variable in curve.driver.variables:
                 for target in variable.targets:
                     add(target.id)
@@ -271,7 +228,7 @@ def bake_transaction(context, *, targets=(), objects=(), chosen=()):
     # Scoped helper cleanup runs while rollback data is still alive. A deferred
     # artist cleanup after discard could fail after recovery became impossible.
     _hosts, snapshot = bake_applied.capture_clear_snapshot(
-        records, extra_fcurve_owners=owners, defer_helper_cleanup=False,
+        records, extra_fcurve_owners=owners,
     )
     for owner in owners:
         snapshot.preserve_action_identity(owner)
@@ -282,8 +239,6 @@ def bake_transaction(context, *, targets=(), objects=(), chosen=()):
             actions[action] = _action_state(action)
     _holding_user_pointers = _snapshot_holding_user_pointers(snapshot)
     _active = True
-    purge_guard = getattr(internal_helpers, 'suspend_purge', nullcontext)()
-    purge_guard.__enter__()
     try:
         yield
     except Exception:
@@ -321,7 +276,6 @@ def bake_transaction(context, *, targets=(), objects=(), chosen=()):
             snapshot.discard()
             context.scene.frame_set(frame, subframe=subframe)
         finally:
-            purge_guard.__exit__(None, None, None)
             _active = False
             _holding_user_pointers = frozenset()
 
@@ -342,23 +296,14 @@ def atomic_bake_operator(cls):
             targets, _unresolved = self._discover(context)
         if operator_id == 'espresso.bake_last_target':
             from ...apply.core import target_memory
-            from types import SimpleNamespace
             resolved, _reason = target_memory.resolve_entry(
                 target_memory.latest_entry(context.scene.espresso_props) or {})
             targets = [SimpleNamespace(**item) for item in resolved or ()]
         if operator_id.endswith('_to_button'):
             from ...ui.menus.context_menu import resolve_button_driver_targets
             targets = resolve_button_driver_targets(context)
-        preflight = getattr(self, '_bake_preflight', None)
-        if preflight is not None:
-            reason = preflight(context, targets)
-            if reason:
-                self.report({'WARNING'}, reason)
-                return {'CANCELLED'}
         try:
-            if operator_id == 'espresso.apply_and_bake_motion':
-                targets = _planned_apply_targets(context)
-            elif operator_id == 'espresso.apply_and_bake_to_button':
+            if operator_id == 'espresso.apply_and_bake_to_button':
                 from ...catalogue import templates
                 from ...ui.state import props as espresso_props
 
@@ -373,19 +318,6 @@ def atomic_bake_operator(cls):
                             targets = motion_channels.motion_targets_for_object(
                                 owner, template, channels=channels,
                             )
-            if operator_id in {
-                'espresso.apply_and_bake_motion',
-                'espresso.apply_and_bake_to_button',
-            }:
-                from ...ui.actions import bake_applied
-
-                if any(bake_applied.target_has_foreign_motion(target) for target in targets):
-                    self.report(
-                        {'WARNING'},
-                        'The selected destination belongs to motion not available '
-                        'in this edition; it was left unchanged.',
-                    )
-                    return {'CANCELLED'}
             with bake_transaction(context, targets=targets, objects=objects):
                 result = execute(self, context)
                 if 'FINISHED' not in result:

@@ -7,7 +7,7 @@ adapters remain responsible for converting real drivers/manifests into claims.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Tuple
 

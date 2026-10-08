@@ -10,19 +10,13 @@ from importlib import import_module
 
 _MODULES = {
     "contracts": ".core.contracts",
-    "diagnostics": ".core.diagnostics",
-    "manifest": ".core.manifest",
-    "orchestrator": ".core.orchestrator",
     "registry": ".core.registry",
     "transaction": ".core.transaction",
     "animation": ".resources.animation",
     "attachments": ".resources.attachments",
-    "datablocks": ".resources.datablocks",
     "helpers": ".resources.helpers",
-    "nodes": ".resources.nodes",
-        "properties": ".resources.properties",
-        "clear_snapshot": ".resources.clear_snapshot",
-        "geometry_node_bindings": ".bindings.geometry_nodes",
+    "properties": ".resources.properties",
+    "clear_snapshot": ".resources.clear_snapshot",
 }
 
 __all__ = tuple(_MODULES)

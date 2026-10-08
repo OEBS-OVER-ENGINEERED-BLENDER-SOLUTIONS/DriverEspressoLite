@@ -1,11 +1,10 @@
-"""Remembered input-source binding for templates that need driver variables."""
+"""The remembered Espresso input: the property a Controller reads, and relinking it."""
 
 from __future__ import annotations
 
 import json
 import re
 
-from ...engine.targeting.button_targeting import ButtonDriverTarget
 from . import target_memory
 from ...engine import utils
 
@@ -38,14 +37,6 @@ ESPRESSO_INPUT_PREFIX = "espinp_"
 LEGACY_INPUT_VARIABLE_NAMES = frozenset({"var", "distance", "steer", "var_idx"})
 
 
-def required_variable_names(template):
-    return [item["name"] for item in template.get("requires_driver_variables", [])]
-
-
-def template_needs_source(template):
-    return bool(required_variable_names(template))
-
-
 def build_source_entry(targets, display_label):
     entry = target_memory.build_entry(targets[:1], display_label, "input_source")
     if entry:
@@ -73,13 +64,14 @@ def clear_source(props):
     props.espresso_input_source = "{}"
 
 
-def source_label(props):
-    entry = latest_source(props)
-    return entry.get("display_label", "") if entry else ""
-
-
-def _driver_id_type(root):
-    return _CLASS_TO_DRIVER_ID_TYPE.get(root.__class__.__name__, root.__class__.__name__.upper())
+def driver_id_type(root):
+    # Walk the class chain: a point lamp is a PointLight, a sun a SunLight, and
+    # all of them are Lights to a driver variable.
+    for cls in type(root).__mro__:
+        found = _CLASS_TO_DRIVER_ID_TYPE.get(cls.__name__)
+        if found:
+            return found
+    return root.__class__.__name__.upper()
 
 
 def _joined_data_path(owner, data_path, index):
@@ -125,7 +117,7 @@ def _source_descriptor(entry, *, require_property):
                 )
 
     return {
-        "id_type": _driver_id_type(root),
+        "id_type": driver_id_type(root),
         "id": root,
         "data_path": _joined_data_path(owner, data_path, index),
         "owner": owner,
@@ -157,166 +149,6 @@ def sample_source_value(entry):
         return float(value[index] if index >= 0 else value)
     except (AttributeError, IndexError, KeyError, ReferenceError, TypeError, ValueError) as exc:
         raise ValueError("The Espresso input property cannot be sampled.") from exc
-
-
-# Variable kinds that describe WHERE the driven thing is, rather than reading a
-# value from somewhere else. A template asking for one of these is asking to be
-# told its own position, which is what lets an identical expression behave
-# differently on every lamp in a row.
-_SELF_POSITION_TYPES = {"TRANSFORMS"}
-# ...and the kinds that additionally need the artist to pick something to
-# measure against.
-_NEEDS_SOURCE_TYPES = {"SINGLE_PROP", "LOC_DIFF"}
-
-
-def _has_centre_variable(template):
-    return any(
-        var_def.get("reads") == "CENTRE"
-        for var_def in template.get("requires_driver_variables", []) or ()
-    )
-
-
-def _has_source_transform_variable(template):
-    return any(
-        var_def.get("type", "SINGLE_PROP") == "TRANSFORMS"
-        and var_def.get("reads") == "SOURCE"
-        for var_def in template.get("requires_driver_variables", []) or ()
-    )
-
-
-def needs_input_source(template):
-    """Whether this template can't be applied until an input source is chosen.
-
-    A template that only wants each object's OWN position is self-contained -
-    it reads the object the driver lands on. Demanding an input source for one
-    is a made-up requirement, and it blocked Position Wave and Radial Sweep
-    from the apply flow entirely. LOC_DIFF is different and still counts: it
-    measures TO something, so it genuinely needs a centre object.
-    """
-    kinds = {
-        var_def.get("type", "SINGLE_PROP")
-        for var_def in template.get("requires_driver_variables", []) or ()
-    }
-    return (
-        bool(kinds & _NEEDS_SOURCE_TYPES)
-        or _has_centre_variable(template)
-        or _has_source_transform_variable(template)
-    )
-
-
-def owner_object_for(driver, fallback=None):
-    """The Object a driver belongs to, for variables that must target it.
-
-    ``driver.id_data`` is the datablock carrying the animation data, which is
-    only sometimes the Object: a light's energy driver reports the Light, and a
-    colour driver reports the node tree. Position variables must target the
-    OBJECT, so the light case has to be resolved back through the objects that
-    use that data.
-
-    Note what this implies for a strip: lamps SHARING one light datablock also
-    share its drivers, so no per-lamp variation is possible however the
-    variable is wired. Each lamp needs its own data for a spatial effect to
-    mean anything - that is a property of Blender, not of this code.
-    """
-    import bpy
-
-    if fallback is not None:
-        return fallback
-    owner = getattr(driver, "id_data", None)
-    if owner is None:
-        return None
-    if isinstance(owner, bpy.types.Object):
-        return owner
-    for candidate in bpy.data.objects:
-        if getattr(candidate, "data", None) is owner:
-            return candidate
-
-    # A driver on a material's node tree - an Emission Strength, say - reports
-    # the SHADER TREE, which is two steps from an object. Walk back through the
-    # material to the objects using it.
-    #
-    # Only an unambiguous answer counts. A material on ten objects has ten
-    # equally valid owners, and picking one would silently bind every object's
-    # driver to whichever happened to be first. Callers that DO know the object
-    # pass it as ``fallback``, which is handled above.
-    users = _objects_using_node_tree(owner)
-    return users[0] if len(users) == 1 else None
-
-
-def _objects_using_node_tree(node_tree):
-    """Every object that carries this embedded shader tree."""
-    from ..motion import applied_motion
-
-    return applied_motion.objects_using_node_tree(node_tree)
-
-
-def bind_required_variables(driver, template, source_entry, owner_object=None):
-    required = template.get("requires_driver_variables", [])
-    if not required:
-        return True, ""
-
-    kinds = {var_def.get("type", "SINGLE_PROP") for var_def in required}
-    unknown = kinds - _SELF_POSITION_TYPES - _NEEDS_SOURCE_TYPES
-    if unknown:
-        return False, "Driver variable type %s needs manual setup." % ", ".join(sorted(unknown))
-
-    # Only demand an input source if something actually needs one. A template
-    # that just wants its own position is self-contained, and asking the artist
-    # to pick an input for it would be a made-up requirement.
-    source = None
-    if (
-        kinds & _NEEDS_SOURCE_TYPES
-        or _has_centre_variable(template)
-        or _has_source_transform_variable(template)
-    ):
-        if not source_entry:
-            return False, "Choose an Espresso input source first."
-        # LOC_DIFF measures to an OBJECT and never reads a property off it, so
-        # insisting the source resolve to a live property would reject the
-        # obvious choice - an Empty used purely as a centre marker.
-        need_property = "SINGLE_PROP" in kinds
-        source, _code, reason = _source_descriptor(
-            source_entry, require_property=need_property)
-        if not source:
-            return False, reason or "Input source no longer exists or is not usable."
-
-    owner = None
-    if kinds & (_SELF_POSITION_TYPES | {"LOC_DIFF"}):
-        owner = owner_object_for(driver, owner_object)
-        if owner is None:
-            return False, "Could not work out which object this driver belongs to."
-
-    for var_def in required:
-        kind = var_def.get("type", "SINGLE_PROP")
-        var = driver.variables.get(var_def["name"])
-        if var is None:
-            var = driver.variables.new()
-            var.name = var_def["name"]
-        var.type = kind
-        if kind == "TRANSFORMS":
-            target = var.targets[0]
-            # Most position variables read the object the driver lands on. A
-            # variable marked CENTRE reads the chosen centre object instead,
-            # which is what lets Radial Sweep turn about a centre the artist
-            # can see and move rather than about the world origin.
-            target.id = (
-                source["id"]
-                if var_def.get("reads") in {"CENTRE", "SOURCE"}
-                else owner
-            )
-            target.transform_type = var_def.get("transform_type", "LOC_X")
-            target.transform_space = var_def.get("transform_space", "WORLD_SPACE")
-        elif kind == "LOC_DIFF":
-            # Distance is measured FROM the driven object TO whatever the
-            # artist chose, so the pair is (self, source) in that order.
-            var.targets[0].id = owner
-            var.targets[1].id = source["id"]
-        else:
-            target = var.targets[0]
-            target.id_type = source["id_type"]
-            target.id = source["id"]
-            target.data_path = source["data_path"]
-    return True, ""
 
 
 def _active_object_driver_owners(active_object):
@@ -487,10 +319,3 @@ def apply_input_relink(plan, props, new_entry):
     count = int(plan.get("count", 0))
     return True, f"Relinked {count} Espresso input variable(s).", count
 
-
-def target_from_entry(entry):
-    resolved, _reason = target_memory.resolve_entry(entry)
-    if not resolved:
-        return None
-    item = resolved[0]
-    return ButtonDriverTarget(item["owner"], item["data_path"], int(item.get("index", -1)))

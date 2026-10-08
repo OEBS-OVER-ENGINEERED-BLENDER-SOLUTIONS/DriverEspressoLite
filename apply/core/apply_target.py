@@ -1,33 +1,20 @@
-"""Which property "apply to my selection" should write to.
+"""Which property "apply to my selection" writes to.
 
-Applying one template across many objects needs to know WHAT to drive. Until
-now that was hardcoded: a light's Power, and nothing else. So a template about
-brightness could reach a lamp but not an emission shader, and selecting meshes
-made the button do nothing at all - silently, which is the worst version.
-
-This is the mirror of the input source. The artist right-clicks the property
-they mean and chooses "Use as Espresso Target", exactly as they would nominate
-an input, and the choice is remembered on the scene. Apply then writes to each
-object's own equivalent of it.
-
-Only the ROUTE to the property is remembered - the owner kind, the data path
-and the index - never a pointer to one object's property. That is the whole
-point: the same route resolved against each selected object is what gives every
-object its own driver.
-
-Lights keep their old behaviour when nothing is nominated, because Power is
-what a lighting template means by default and asking first would be a step
-added for no gain.
+Applying one template across many objects needs to know what to drive. The artist
+right-clicks the property they mean and chooses "Use as Espresso Target", the same way
+they nominate an input; the choice is remembered on the scene. Only the route to the
+property is stored (owner kind, data path and index), never a pointer to one object's
+property, so the same route resolved against each selected object gives every object its
+own driver. When nothing is nominated, lights drive their Power.
 """
 
 from __future__ import annotations
 
 import json
 
-import bpy
 
-# Owner kinds a target route can name. Deliberately not "the datablock I
-# clicked": a route has to survive being resolved against a different object.
+# Owner kinds a target route can name. A route names a kind rather than the datablock
+# that was clicked, so it can be resolved against a different object.
 OWNER_OBJECT = "OBJECT"
 OWNER_DATA = "DATA"
 OWNER_MATERIAL = "MATERIAL"
@@ -48,20 +35,31 @@ def describe(owner, owner_object, data_path, index):
 
     Returns None when the owner is not something with an equivalent elsewhere,
     rather than inventing a route that would resolve to nothing.
+
+    A button inside a datablock (a node socket, a modifier, a constraint) hands
+    over that inner struct as its owner; the route is then the struct's path
+    from its datablock, so it can be resolved against another object's own.
     """
-    if owner is owner_object:
+    root = getattr(owner, "id_data", None)
+    if root is not None and root != owner:
+        try:
+            data_path = owner.path_from_id(data_path)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        owner = root
+    if owner == owner_object:
         kind, material_index = OWNER_OBJECT, 0
-    elif owner is getattr(owner_object, "data", None):
+    elif owner == getattr(owner_object, "data", None):
         kind, material_index = OWNER_DATA, 0
     else:
         kind, material_index = None, 0
         materials = list(
             getattr(getattr(owner_object, "data", None), "materials", None) or ())
         for slot, material in enumerate(materials):
-            if owner is material:
+            if owner == material:
                 kind, material_index = OWNER_MATERIAL, slot
                 break
-            if owner is getattr(material, "node_tree", None):
+            if owner == getattr(material, "node_tree", None):
                 kind, material_index = OWNER_NODE_TREE, slot
                 break
         if kind is None:
@@ -77,13 +75,10 @@ def describe(owner, owner_object, data_path, index):
 
 
 def _label_for(kind, owner, data_path, index):
-    """Something readable for the panel - the route, not the value.
-
-    A node socket's data path is unreadable as-is
-    (``nodes["Principled BSDF"].inputs[28].default_value``), so the socket is
-    RESOLVED and asked its name rather than having one parsed out of the path.
-    Parsing produced "input 28].default_value", which is worse than the raw
-    path it was meant to improve on.
+    """Something readable for the panel: the route, not the value. A node socket's data
+    path is unreadable as-is (``nodes["Principled BSDF"].inputs[28].default_value``),
+    so the socket is resolved and asked its name rather than having one parsed out of
+    the path.
     """
     readable = data_path
     if data_path.startswith("nodes[") and data_path.endswith(".default_value"):
@@ -131,10 +126,9 @@ def targets_for(entry, obj):
         owner.path_resolve(entry["data_path"])
     except Exception:
         return [], "has no %s" % entry["data_path"]
-    # The object is named here rather than left to be inferred. For a material
-    # target the owner is a node tree, and inferring which object that belongs
-    # to is impossible when the material is shared - which is exactly when
-    # applying across a selection happens.
+    # The object is named here rather than inferred. For a material target the owner is
+    # a node tree, and which object it belongs to is ambiguous when the material is
+    # shared, which is exactly when applying across a selection happens.
     return [ButtonDriverTarget(
         owner, entry["data_path"], entry["index"], owner_object=obj)], ""
 

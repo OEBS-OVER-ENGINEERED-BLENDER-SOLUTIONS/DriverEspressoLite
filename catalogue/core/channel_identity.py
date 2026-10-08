@@ -81,9 +81,3 @@ def axis_color(identity):
         return None
     return AXIS_COLORS[identity.axis]
 
-
-def compatible_overlay_ids(selected, siblings):
-    return tuple(
-        item.id for item in siblings
-        if overlay_compatible(selected, item)
-    )

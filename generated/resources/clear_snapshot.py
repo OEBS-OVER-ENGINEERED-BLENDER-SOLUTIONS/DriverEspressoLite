@@ -1,9 +1,9 @@
-"""Identity-preserving snapshots for generated CLEAR rollback.
+"""Identity-preserving snapshots for CLEAR and BAKE rollback.
 
-Route `clear()` and layout teardown destroy Blender datablocks. Restoring only
-applied-motion JSON leaves records pointing at missing modifiers, node groups,
-helpers, and carriers. This module copies the owned graph before mutation so
-rollback can put the same identities back.
+Clearing an effect removes drivers, helper objects and the records that point
+at them. Restoring only the applied-motion JSON would leave records pointing at
+things that no longer exist. This module copies what is about to change, so a
+failed operation can put the same identities back.
 """
 
 from __future__ import annotations
@@ -63,19 +63,6 @@ def _resolve_owner(identity):
         return root.path_resolve(path) if path else root
     except (ValueError, AttributeError, ReferenceError):
         return None
-
-
-def _remove_driver(owner, data_path, index):
-    if index >= 0:
-        try:
-            owner.driver_remove(data_path, index)
-        except Exception:
-            return
-        return
-    try:
-        owner.driver_remove(data_path)
-    except Exception:
-        pass
 
 
 def _add_driver(owner, data_path, index):
@@ -431,11 +418,9 @@ class GeneratedClearSnapshot:
         self._token = _HOLDING_PREFIX + uuid.uuid4().hex[:12]
         self._objects = []
         self._ids = []
-        self._collections = []
         self._node_groups = []
         self._data_copies = []
         self._records = {}
-        self._source_state = []
         self._actions = {}
         self._known_actions = set(bpy.data.actions.keys())
         self._discarded = False
@@ -556,39 +541,15 @@ class GeneratedClearSnapshot:
                 continue
             copied = group_map.get(group.name)
             if copied is None:
-                copied = group.copy()
-                copied.use_fake_user = True
-                copied.name = self._token + "_ng_" + group.name
+                # The same capture a node group gets when it is a host itself, so a
+                # restore finds everything it needs (owner, drivers, graph) for it.
+                self.capture_node_group(group)
+                identity = _owner_identity(group)
+                copied = next(item["copy"] for item in self._node_groups if item["owner"] == identity)
                 group_map[group.name] = copied
-                self._node_groups.append({
-                    "original_name": group.name,
-                    "copy": copied,
-                })
             modifier.node_group = copied
             if original is not None:
                 _copy_id_properties(original, modifier)
-        palette = obj.get("__espresso_layout_source_collection")
-        palette_name = ""
-        source_names = []
-        if isinstance(palette, bpy.types.Collection):
-            palette_name = palette.name
-            holding = bpy.data.collections.new(self._token + "_col_" + palette.name)
-            holding.use_fake_user = True
-            for child in list(palette.objects):
-                holding.objects.link(child)
-                source_names.append(child.name)
-                if not any(item["name"] == child.name for item in self._source_state):
-                    self._source_state.append({
-                        "name": child.name,
-                        "hide_render": bool(child.hide_render),
-                        "hide_viewport": bool(child.hide_get()),
-                    })
-            clone["__espresso_layout_source_collection"] = holding
-            self._collections.append({
-                "original_name": palette_name,
-                "copy": holding,
-                "source_names": tuple(source_names),
-            })
         self._objects.append({
             "name": obj.name,
             "source_pointer": obj.as_pointer(),
@@ -604,8 +565,6 @@ class GeneratedClearSnapshot:
             ),
             "drivers": _snapshot_drivers(obj),
             "modifiers": _captured_modifiers(obj),
-            "source_names": tuple(source_names),
-            "palette_name": palette_name,
             "data_collection": data_collection,
         })
         key = _host_key(obj)
@@ -651,7 +610,7 @@ class GeneratedClearSnapshot:
         if key not in self._records:
             self._records[key] = copy.deepcopy(applied_motion.read(block))
 
-    def capture_record(self, host, record=None):
+    def capture_record(self, host):
         if host is None:
             return
         if isinstance(host, bpy.types.Object):
@@ -681,68 +640,12 @@ class GeneratedClearSnapshot:
             if child is not None:
                 self.capture_node_group(child)
 
-    def capture_collection(self, collection):
-        """Retain an owned collection and its explicit scene/parent membership."""
-        if collection is None or not _alive(collection, "collections"):
-            return
-        if any(item["original_name"] == collection.name for item in self._collections):
-            return
-        parents = tuple(parent.name for parent in bpy.data.collections
-                        if not parent.name.startswith(self._token)
-                        and collection.name in parent.children)
-        scenes = tuple(scene.name for scene in bpy.data.scenes
-                       if collection.name in scene.collection.children)
-        copied = collection.copy()
-        copied.use_fake_user = True
-        copied.name = self._token + "_col_" + collection.name
-        self._collections.append({
-            "original_name": collection.name, "copy": copied,
-            "source_names": tuple(obj.name for obj in collection.objects),
-            "collection_state": {
-                "parents": parents, "scenes": scenes,
-                "children": tuple(child.name for child in collection.children),
-                "values": {name: getattr(collection, name) for name in (
-                    "hide_render", "hide_viewport", "hide_select", "color_tag")},
-                "instance_offset": tuple(collection.instance_offset),
-                "properties": _id_property_map(collection),
-            },
-        })
-
-    def isolate_node_group_copies(self):
-        """Make the rollback graph independent from every live nested group.
-
-        Blender's node-group copy is shallow: copied group nodes still point at
-        their live child groups.  That extra user prevents strict lifecycle
-        clears from removing an otherwise fully owned live hierarchy.  Call
-        this after all groups in the closure have been captured so holding
-        parents reference holding children exclusively.
-        """
-        entries = tuple(self._node_groups)
-        copies = {tuple(item['owner'].get(k, '') for k in ('id_type', 'id_name', 'library', 'owner_path')): item['copy'] for item in entries}
-        holding = {item['copy'].as_pointer() for item in entries}
-        graphs = [item['copy'] for item in entries]
-        graphs.extend(item['graph_copy'] for item in self._ids if 'graph_copy' in item)
-        for copied in graphs:
-            if not _id_alive(copied):
-                continue
-            for node in tuple(getattr(copied, "nodes", ()) or ()):
-                child = getattr(node, "node_tree", None)
-                if child is None:
-                    continue
-                if child.as_pointer() in holding:
-                    continue
-                replacement = copies.get(_host_key(child))
-                if replacement is not None and child is not replacement:
-                    node.node_tree = replacement
-
     def restore(self):
         """Put copied identities back, then drop unpromoted holding copies."""
         if self._discarded:
             return self.restored
         ok = True
         try:
-            for callback in getattr(self, '_before_restore_callbacks', ()):
-                callback()
             ok = self._restore_identities()
         except ReferenceError:
             ok = False
@@ -784,21 +687,6 @@ class GeneratedClearSnapshot:
             live = _resolve_owner(item['owner'])
             if live is not None and 'graph_copy' in item:
                 node_graph_snapshot.restore(live, item['graph_copy'])
-        for item in self._collections:
-            holding = item["copy"]
-            if not _alive(holding, "collections"):
-                ok = False
-                continue
-            original = bpy.data.collections.get(item["original_name"])
-            if original is None:
-                holding.name = item["original_name"]
-                holding.use_fake_user = False
-                original = holding
-                item["promoted"] = True
-            for source_name in item["source_names"]:
-                source = bpy.data.objects.get(source_name)
-                if source is not None and source.name not in original.objects:
-                    original.objects.link(source)
         for item in self._objects:
             try:
                 clone = item["copy"]
@@ -836,7 +724,6 @@ class GeneratedClearSnapshot:
         # Every captured target must exist before any parent, constraint or
         # driver is rebound. Capture order is not dependency order.
         restored = self._restored_objects()
-        self._restore_collection_links(driver_errors)
         for item in self._objects:
             try:
                 live = bpy.data.objects.get(item["name"])
@@ -854,19 +741,10 @@ class GeneratedClearSnapshot:
                     self._restore_action_state(
                         live.data, item.get("data_action_state")
                     )
-                if item["palette_name"]:
-                    palette = bpy.data.collections.get(item["palette_name"])
-                    if palette is not None:
-                        live["__espresso_layout_source_collection"] = palette
                 _restore_drivers(live, item["drivers"], driver_errors)
                 records = self._records.get(_host_key(live)) or self._records.get(item["name"])
                 if records:
                     applied_motion.write(live, records)
-                for source_name in item["source_names"]:
-                    source = bpy.data.objects.get(source_name)
-                    if source is None:
-                        continue
-                    source["__espresso_layout_carrier"] = live
             except ReferenceError:
                 ok = False
                 continue
@@ -880,7 +758,6 @@ class GeneratedClearSnapshot:
             records = self._records.get(item["id_key"])
             if records:
                 applied_motion.write(live, records)
-        self._restore_source_visibility()
         for item in self._node_groups:
             live = _resolve_owner(item['owner'])
             if live is not None:
@@ -892,59 +769,6 @@ class GeneratedClearSnapshot:
     def _restored_objects(self):
         return {item["source_pointer"]: bpy.data.objects.get(item["name"])
                 for item in self._objects}
-
-    def _restore_collection_links(self, errors):
-        for item in self._collections:
-            state = item.get("collection_state")
-            if state is None:
-                continue
-            collection = bpy.data.collections.get(item["original_name"])
-            if collection is None:
-                continue
-            try:
-                for name, value in state["values"].items():
-                    setattr(collection, name, value)
-                collection.instance_offset = state["instance_offset"]
-                for key in _id_property_map(collection):
-                    if key not in state["properties"]:
-                        del collection[key]
-                _apply_id_properties(collection, state["properties"])
-                for obj in list(collection.objects):
-                    if obj.name not in item["source_names"]:
-                        collection.objects.unlink(obj)
-                for name in item["source_names"]:
-                    obj = bpy.data.objects.get(name)
-                    if obj is None:
-                        errors.append("collection %s missing object %s" % (collection.name, name))
-                    elif name not in collection.objects:
-                        collection.objects.link(obj)
-                for child in list(collection.children):
-                    if child.name not in state["children"]:
-                        collection.children.unlink(child)
-                for name in state["children"]:
-                    child = bpy.data.collections.get(name)
-                    if child is None:
-                        errors.append("collection %s missing child %s" % (collection.name, name))
-                    elif name not in collection.children:
-                        collection.children.link(child)
-                for parent in bpy.data.collections:
-                    if parent.name.startswith(self._token):
-                        continue
-                    wanted = parent.name in state["parents"]
-                    linked = collection.name in parent.children
-                    if wanted and not linked:
-                        parent.children.link(collection)
-                    elif linked and not wanted:
-                        parent.children.unlink(collection)
-                for scene in bpy.data.scenes:
-                    wanted = scene.name in state["scenes"]
-                    linked = collection.name in scene.collection.children
-                    if wanted and not linked:
-                        scene.collection.children.link(collection)
-                    elif linked and not wanted:
-                        scene.collection.children.unlink(collection)
-            except Exception as exc:
-                errors.append("collection %s restore: %s" % (collection.name, exc))
 
     def _purge_unknown_actions(self):
         """Remove bake-created Actions after every captured owner was restored."""
@@ -1016,31 +840,6 @@ class GeneratedClearSnapshot:
                 continue
             modifiers.move(current_index, target_index)
 
-    def _restore_source_visibility(self):
-        for state in self._source_state:
-            source = bpy.data.objects.get(state["name"])
-            if source is None:
-                continue
-            source.hide_render = bool(state.get("hide_render", False))
-            source.hide_set(bool(state.get("hide_viewport", False)))
-
-    def before_restore(self, callback):
-        """Restore route-owned structures before their captured animation."""
-        if not callable(callback):
-            raise TypeError('Restore callback must be callable')
-        if not hasattr(self, '_before_restore_callbacks'):
-            self._before_restore_callbacks = []
-        self._before_restore_callbacks.append(callback)
-
-    def on_discard(self, callback):
-        """Release route-owned zero-user resources after holding copies vanish."""
-        if not callable(callback):
-            raise TypeError('Discard callback must be callable')
-        callbacks = getattr(self, '_discard_callbacks', None)
-        if callbacks is None:
-            self._discard_callbacks = callbacks = []
-        callbacks.append(callback)
-
     def discard(self):
         """Drop holding copies after a committed CLEAR or a finished rollback."""
         if self._discarded:
@@ -1060,14 +859,6 @@ class GeneratedClearSnapshot:
             except Exception:
                 pass
             self._remove_unused_data(data)
-        for item in self._collections:
-            holding = item["copy"]
-            if not _alive(holding, "collections") or not holding.name.startswith(self._token):
-                continue
-            try:
-                bpy.data.collections.remove(holding)
-            except Exception:
-                pass
         for item in self._node_groups:
             group = item["copy"]
             if not _alive(group, "node_groups") or not group.name.startswith(self._token):
@@ -1092,9 +883,6 @@ class GeneratedClearSnapshot:
         for item in self._data_copies:
             self._remove_unused_data(item.get("copy"), item.get("collection") or "")
         self._purge_token_prefixed()
-        for callback in getattr(self, '_discard_callbacks', ()):
-            callback()
-        self._discard_callbacks = []
 
     def _remove_unused_data(self, data, collection_name=""):
         if data is None:
@@ -1264,38 +1052,6 @@ class GeneratedClearSnapshot:
                 if node_graph_snapshot.fingerprint(live) != item['graph_state']:
                     errors.append('node group graph mismatch on %s' % item['original_name'])
                 _verify_drivers(live, item['drivers'], item['original_name'], errors)
-        for item in self._collections:
-            collection = bpy.data.collections.get(item["original_name"])
-            if collection is None:
-                errors.append("missing collection %s" % item["original_name"])
-                continue
-            state = item.get("collection_state")
-            if state is not None:
-                checks = {
-                    "objects": (set(obj.name for obj in collection.objects), set(item["source_names"])),
-                    "parents": ({parent.name for parent in bpy.data.collections
-                                 if not parent.name.startswith(self._token)
-                                 and collection.name in parent.children}, set(state["parents"])),
-                    "scenes": ({scene.name for scene in bpy.data.scenes
-                                if collection.name in scene.collection.children}, set(state["scenes"])),
-                    "children": ({child.name for child in collection.children}, set(state["children"])),
-                    "properties": (_id_property_map(collection), state["properties"]),
-                    "instance_offset": (tuple(collection.instance_offset), state["instance_offset"]),
-                }
-                checks.update({name: (getattr(collection, name), value)
-                               for name, value in state["values"].items()})
-                for name, (actual, expected) in checks.items():
-                    if actual != expected:
-                        errors.append("collection %s %s mismatch" % (collection.name, name))
-        for state in self._source_state:
-            source = bpy.data.objects.get(state["name"])
-            if source is None:
-                errors.append("missing source %s" % state["name"])
-                continue
-            if bool(source.hide_render) != bool(state.get("hide_render", False)):
-                errors.append("source %s hide_render mismatch" % state["name"])
-            if bool(source.hide_get()) != bool(state.get("hide_viewport", False)):
-                errors.append("source %s hide_viewport mismatch" % state["name"])
         if self._discarded:
             leftovers = self.holding_leftovers()
             if leftovers:
@@ -1308,7 +1064,7 @@ def capture(hosts_and_records, extra_objects=(), extra_fcurve_owners=()):
     snapshot = GeneratedClearSnapshot()
     try:
         for host, record in hosts_and_records:
-            snapshot.capture_record(host, record)
+            snapshot.capture_record(host)
             if _id_alive(host):
                 key = _host_key(host)
                 if key not in snapshot._records:

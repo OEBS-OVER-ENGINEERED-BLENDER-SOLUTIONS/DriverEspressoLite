@@ -84,14 +84,11 @@ def save(data: dict) -> None:
 
 
 def record_preset_click(template_id: str, preset_label: str) -> None:
-    """Increment the click count for a master preset, keyed by its label.
-
-    Keyed by label rather than by position, matching how parameter presets are
-    already stored. A position is meaningless on its own - a file full of
-    ``{"4": 25}`` cannot be read by a human - and worse, it silently rots: adding,
-    removing or reordering a template's presets re-points every stored index at a
-    different preset, so the "most used" shelf starts ranking by counts that were
-    earned by something else.
+    """Increment the click count for a master preset, keyed by its label. Keyed by label
+    rather than by position, matching how parameter presets are stored: a position is
+    meaningless on its own (a file full of ``{"4": 25}`` cannot be read by a human),
+    and adding, removing or reordering a template's presets would re-point every
+    stored index at a different preset.
     """
     data = load()
     usage = data.setdefault("master_preset_usage", {})

@@ -1,1 +1,1 @@
-"""Motion-channel application and pose/camera/vehicle services."""
+"""Motion-channel application, applied-effect records and layering."""

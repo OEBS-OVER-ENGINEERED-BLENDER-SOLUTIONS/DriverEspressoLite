@@ -2,13 +2,13 @@
 
 Ready-made motion for Blender. Pick a template, apply it to anything in Blender, and adjust it while the scene plays.
 
-Driver Espresso Lite is the starter edition, with 18 templates across 6 categories:
+Driver Espresso Lite is the starter edition, with 20 templates across 6 categories:
 
 | Category | Templates |
 | --- | --- |
-| Spin & Rotate | Constant Speed, Loop in N Frames, Repeating Rotation Ramp, Scene Length Loop |
+| Spin & Rotate | Constant Speed, Ease In Rotation, Loop in N Frames, Repeating Rotation Ramp, Scene Length Loop |
 | Swing & Oscillate | Generic Sawtooth Wave, Sine Oscillation, Triangle Wave |
-| Ease & Spring | Ease Out Transition, Linear Transition, Smoothstep Transition |
+| Ease & Spring | Ease In Transition, Ease Out Transition, Linear Transition, Smoothstep Transition |
 | Trigger & State | Linear Fade In, Smooth Fade Out, Repeating Pulse |
 | Light & Flicker | Candle Flicker, Simple Blink |
 | RGB & Neon Lighting | RGB Colour Cycle, RGB Marquee Chase, RGB Twinkle |
@@ -17,7 +17,7 @@ Driver Espresso Lite is the starter edition, with 18 templates across 6 categori
 
 Requires Blender 4.2 or newer.
 
-1. Download `DriverEspressoLite-v1.6.5.zip` from the [latest release](https://github.com/OEBS-OVER-ENGINEERED-BLENDER-SOLUTIONS/DriverEspressoLite/releases/latest). Leave it zipped.
+1. Download `DriverEspressoLite-v1.6.6.zip` from the [latest release](https://github.com/OEBS-OVER-ENGINEERED-BLENDER-SOLUTIONS/DriverEspressoLite/releases/latest). Leave it zipped.
 2. In Blender, open **Edit > Preferences > Get Extensions**, open the menu in the top-right corner and choose **Install from Disk**.
 3. Pick the ZIP, then enable **Driver Espresso Lite**.
 
@@ -33,7 +33,7 @@ The panel is also available in the Graph Editor and in the Shader, Geometry Node
 ## Good to know
 
 - The preview graph shows the motion before you apply it.
-- **Apply as Sequence** repeats one motion across several selected objects or bones, each starting a few frames after the last.
+- **Apply to Selected Objects** gives every selected object its own copy of the motion; objects that share a material can each be given their own copy of it.
 - The motion is made of standard Blender drivers, so it keeps playing in files opened without the add-on.
 - **Bake Drivers to Keyframes** turns a motion into keyframes when you want to edit it by hand.
 

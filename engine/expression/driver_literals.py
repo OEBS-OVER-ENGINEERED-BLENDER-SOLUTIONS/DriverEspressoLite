@@ -108,26 +108,20 @@ def round_parameter(value):
 
 
 def format_computed_literal(value):
-    """Shortest literal for a value the engine CALCULATED, not one it measured.
+    """Shortest literal for a value the engine calculated, as opposed to one it
+    measured.
 
-    Bounded gains and derived references are float64 results of a division or a
-    sum. When such a value is not exactly representable in float32,
-    ``format_driver_literal`` falls back to ``repr()`` and emits all seventeen
-    significant digits - ``1.0291846714942001`` for a gain of roughly 1.03.
-    Two of those in one expression is 36 characters, and rgb_colour_cycle blew
-    past Blender's 255-character ceiling on exactly that.
+    Bounded gains and derived references are float64 results of a division or a sum.
+    When such a value is not exactly representable in float32, ``format_driver_literal``
+    falls back to ``repr()`` and emits all seventeen significant digits, and two of
+    those in one expression can push a recipe past Blender's 255-character limit. The
+    driver result is written into a float32 property, so digits beyond about seven
+    significant figures are discarded anyway; snapping the value to float32 first
+    changes no rendered result and lets the normal shortest-round-trip search work.
 
-    The digits beyond float32 cannot survive anyway: the driver result is
-    written into a float32 property, so anything finer than about seven
-    significant figures is discarded on assignment. Snapping the value to
-    float32 first therefore changes no rendered result while letting the normal
-    shortest-round-trip search do its job.
-
-    NOT for measured values. ``round_parameter`` documents why rest-start
-    anchors and scene readings stay exact - rounding those reintroduces the
-    apply-time jump they exist to prevent. This function is different in kind:
-    a measured float32 snaps to itself, so passing one through is a no-op,
-    while a computed float64 loses only the digits the property cannot store.
+    Not for measured values: ``round_parameter`` explains why rest-start anchors and
+    scene readings stay exact. A measured float32 snaps to itself, so passing one
+    through is harmless.
     """
     try:
         number = float(value)

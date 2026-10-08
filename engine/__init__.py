@@ -15,8 +15,6 @@ _MODULES = {
     "duration": ".expression.duration",
     "utils": ".expression.utils",
     "button_targeting": ".targeting.button_targeting",
-    "quaternion_channels": ".targeting.quaternion_channels",
-    "stagger_apply": ".targeting.stagger_apply",
 }
 
 __all__ = tuple(_MODULES)

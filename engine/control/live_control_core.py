@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 
 from ..expression.driver_literals import format_driver_literal
 
@@ -22,32 +21,6 @@ TRANSITIONS = frozenset({
     TRANSITION_IMMEDIATE, TRANSITION_LINEAR,
     TRANSITION_SMOOTH, TRANSITION_EASE_IN_OUT,
 })
-
-
-@dataclass(frozen=True)
-class CaptureState:
-    frame: int
-    value: float
-    source_signature: str
-
-
-def transition_weight(frame, capture, mode=TRANSITION_IMMEDIATE, duration=0):
-    if mode == TRANSITION_IMMEDIATE or int(duration) <= 0:
-        return 1.0 if float(frame) >= float(capture.frame) else 0.0
-    value = max(0.0, min(1.0, (float(frame) - float(capture.frame)) / float(duration)))
-    if mode == TRANSITION_SMOOTH:
-        return value * value * (3.0 - 2.0 * value)
-    if mode == TRANSITION_EASE_IN_OUT:
-        return value * value * value * (10.0 + value * (-15.0 + 6.0 * value))
-    return value
-
-
-def capture_is_fresh(capture, source_signature):
-    return bool(capture and capture.source_signature == str(source_signature or ""))
-
-
-def supports_safe_disable(additive_profile):
-    return str(additive_profile or "").upper() != "ELAPSED_TIME"
 
 
 def _normalized_control(variable_name, clamp, invert):

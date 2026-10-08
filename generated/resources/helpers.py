@@ -50,11 +50,3 @@ def remove_empty(helper, *, require_unused: bool = False) -> bool:
     bpy.data.objects.remove(helper, do_unlink=True)
     return True
 
-
-def remove_collection(value, *, require_empty: bool = True) -> bool:
-    if value is None or value.name not in bpy.data.collections:
-        return False
-    if require_empty and (value.objects or value.children):
-        return False
-    bpy.data.collections.remove(value)
-    return True

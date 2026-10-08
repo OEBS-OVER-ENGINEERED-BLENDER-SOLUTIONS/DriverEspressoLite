@@ -22,16 +22,13 @@ _MAX_ENTRIES = 24
 
 # Where the collection is remembered between add-on reloads.
 #
-# A preview collection must be handed back to bpy.utils.previews.remove(), and
-# Blender tracks the outstanding ones in its own module-level registry. Our
-# _pcoll reference does NOT survive a reload: reloading rebuilds this module
-# with _pcoll = None, so unregister() has nothing to hand back, the old
-# collection is orphaned, and Blender reports
-# "ResourceWarning: ImagePreviewCollection ... left open" when it is collected.
-#
-# bpy.app.driver_namespace is a plain dict owned by Blender, so it outlives this
-# module being rebuilt. Stashing the collection there lets a later load find and
-# reuse it instead of leaking one collection per reload.
+# A preview collection must be handed back to ``bpy.utils.previews.remove()``, and
+# Blender tracks the outstanding ones in its own module-level registry. Our ``_pcoll``
+# reference does not survive a reload (the module is rebuilt with ``_pcoll = None``), so
+# ``unregister()`` would have nothing to hand back and Blender would report
+# "ImagePreviewCollection left open" when the old collection is collected.
+# ``bpy.app.driver_namespace`` is a plain dict owned by Blender and outlives the module,
+# so stashing the collection there lets a later load find and reuse it.
 _STASH_KEY = "driver_espresso_preview_collection"
 
 
@@ -107,20 +104,17 @@ def get_graph_icon_id(name, pixels, size):
 
 
 def refresh_graph_icon(name, pixels, size):
-    """Create ``name`` or RE-UPLOAD pixels into it, returning its icon id.
+    """Create ``name`` or re-upload pixels into it, returning its icon id.
 
-    get_graph_icon_id deliberately skips the upload when the preview already
-    exists, because for a keyed graph identical name means identical pixels.
-    The playback cursor is the one case where that is false: the name is held
-    stable on purpose so a whole playback occupies ONE cache entry, and the
-    pixels change every frame as the playhead moves.
-
-    Reusing the entry is not a micro-optimisation. A 224x224 RGBA float preview
-    is 784 KB, so keying per frame would allocate about 191 MB across a
-    250-frame playback, and this collection cannot evict individually - at its
-    entry cap it clears wholesale, which would throw away every cached graph
-    mid-playback. Measured: re-uploading keeps the icon id stable, so the panel
-    keeps drawing the same icon while its contents change underneath.
+    ``get_graph_icon_id`` skips the upload when the preview already exists, because for
+    a keyed graph the same name means the same pixels. The playback cursor is the
+    exception: the name is held stable so a whole playback occupies one cache entry,
+    while the pixels change every frame as the playhead moves. Reusing the entry matters
+    for memory: a 224x224 RGBA float preview is 784 KB, so keying per frame would
+    allocate about 191 MB across a 250-frame playback, and this collection cannot evict
+    individually; at its entry cap it clears wholesale, which would discard every cached
+    graph mid-playback. Re-uploading keeps the icon id stable, so the panel keeps
+    drawing the same icon while its contents change.
     """
     if _pcoll is None:
         return None

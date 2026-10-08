@@ -158,18 +158,13 @@ def _node_fcurves(tree, selected_nodes):
                 break
 
 
-
 def _selected_bone_filter(context, active_object):
     """Bone names to keep, or None to keep everything.
 
-    An armature owns every one of its bones' drivers, so a rig with drivers on
-    a hundred bones puts a hundred times its channel count into this list -
-    measured on a production rig, 387 rows, none of which the artist was looking
-    for. In Pose Mode the selection already says which bones they mean, so
-    honour it.
-
-    Returns None outside Pose Mode, or when nothing is selected: an empty list
-    there would blank the panel, which reads as broken rather than as filtered.
+    An armature owns every one of its bones' drivers, so a rig with drivers on many
+    bones would flood the list. In Pose Mode the selection says which bones are meant,
+    so it is honoured. Returns None outside Pose Mode or when nothing is selected,
+    because an empty list would blank the panel.
     """
     if getattr(context, "mode", "") != "POSE":
         return None
@@ -269,12 +264,10 @@ def _append_applied_effect_targets(active_object, append):
     """
     if active_object is None:
         return
-    # Hosts the ordinary walk above already visits are LEFT ALONE. Their rows
-    # are filtered on purpose -- Pose Mode shows only the selected bones,
-    # because an armature with drivers on a hundred bones is not a list -- and
-    # adding recorded drivers back here would override that and put all of
-    # them on screen again. Measured: it did, and the bone-selection suite
-    # caught it. Only the hosts the bounded walk never reaches are added.
+    # Hosts the ordinary walk above already visits are left alone: their rows are
+    # filtered on purpose (Pose Mode shows only the selected bones), and adding recorded
+    # drivers back here would undo that. Only hosts the bounded walk never reaches are
+    # added.
     walked = {id(active_object)}
     data = getattr(active_object, "data", None)
     for covered in (data, getattr(data, "node_tree", None),
@@ -396,10 +389,10 @@ def scene_targets(scene):
                 (record.get("extras") if isinstance(record.get("extras"), dict) else {}).get("target_entry")
                 or {}
             )
-            # The effect record's paths are authoritative and let Scene expose
-            # every child of a motion set even when its legacy target-memory
-            # entry is absent.  Use that entry only for old records whose paths
-            # cannot be resolved directly.
+            # The effect record's paths are authoritative and let the Scene list every
+            # child of a motion set even when the target-memory entry is absent. The
+            # entry is used only for older records whose paths cannot be resolved
+            # directly.
             targets = _scene_channel_targets(host, record) or targets_from_entry(entry)
             for target in targets:
                 row = dict(target)

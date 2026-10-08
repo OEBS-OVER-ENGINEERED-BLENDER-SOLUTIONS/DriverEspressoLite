@@ -8,6 +8,7 @@ import json
 import math
 import re
 
+from . import formula_reader
 from .driver_literals import format_computed_literal, format_driver_literal, round_parameter
 from ...catalogue.core.templates import CUSTOM_RANGE, ENDPOINT_HIT, FIXED_PERIOD, PLAYBACK_WRAP
 
@@ -77,36 +78,6 @@ REST_START_ADDITIVE = "ADDITIVE"
 REST_START_OFFSET_ONLY = "OFFSET_ONLY"
 
 
-def rest_start_summary(mode, apply_frame, *, is_motion=False, additive_profile=None):
-    """Friendly UI copy for the effective apply-time contract."""
-    if mode == REST_START_ADDITIVE:
-        text = (
-            f"Starts from the current value on frame {int(apply_frame)}; "
-            "earlier frames hold that value."
-        )
-    elif mode == REST_START_OFFSET_ONLY:
-        if additive_profile == "BOUNDED_MIN":
-            text = (
-                "Keeps the scene-time phase and adds Current Value + Minimum "
-                "as one fixed shift; it may jump when applied."
-            )
-        elif additive_profile == "BOUNDED_MAX":
-            text = (
-                "Keeps the scene-time phase and adds Current Value + Maximum "
-                "as one fixed shift; it may jump when applied."
-            )
-        else:
-            text = (
-                f"Keeps the scene-time phase and applies one fixed shift so frame "
-                f"{int(apply_frame)} matches the current value."
-            )
-    else:
-        text = "Uses the template's authored scene-time phase without a timeline restart."
-    if is_motion:
-        text += " Object placement remains relative to the current transform."
-    return text
-
-
 DEFAULT_FPS = 24  # Blender's own default, used when no scene is available.
 
 
@@ -153,15 +124,13 @@ def _token_pattern(tokens_longest_first):
 
 
 @functools.lru_cache(maxsize=512)
-def _cached_compile(source, filename):
-    """Compile once and reuse the code object.
-
-    A code object is immutable bytecode - every eval() below still builds a
-    fresh namespace, so nothing leaks between calls. Only the parse/compile
-    step is skipped, which measured as ~76% of resolve_derived_tokens' cost.
-    Cleared in unregister() for reload hygiene.
+def _parsed(source, filename):
+    """Read an expression once and reuse it. The result is stateless (every call below
+    still passes a fresh namespace) and only the parsing is skipped, which is most of
+    the cost of ``resolve_derived_tokens``. Cleared in unregister() on reload.
+    ``filename`` is kept for callers and is not used.
     """
-    return compile(source, filename, "eval")
+    return formula_reader.parse(source)
 
 
 BLOCKING_WARNING_PREFIX = "Cannot apply: "
@@ -188,7 +157,7 @@ def template_checks(template, token_values):
         namespace = dict(SAFE_NAMESPACE)
         namespace.update(token_values)
         try:
-            hit = bool(eval(_cached_compile(formula, "<warn_if>"), {"__builtins__": {}}, namespace))
+            hit = bool(_parsed(formula, "<warn_if>")(namespace))
         except Exception as exc:  # noqa: BLE001 - a broken check must be visible
             out.append(BLOCKING_WARNING_PREFIX + "%s: check %r failed (%s)." % (
                 (template or {}).get("id", "?"), formula, exc))
@@ -231,7 +200,7 @@ def resolve_derived_tokens(template, token_values):
             namespace.update(token_values)
             namespace.update(derived)
             try:
-                value = eval(_cached_compile(formula, "<derived_param>"), {"__builtins__": {}}, namespace)
+                value = _parsed(formula, "<derived_param>")(namespace)
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(
                     f"{template.get('id', '?')}: cannot derive {target} from {param['token']}: {exc}"
@@ -247,11 +216,6 @@ def colour_component_tokens(token):
 
 def coerce_value(param, raw_value):
     kind = param.get("type", "FLOAT")
-    if kind in {"STRING", "ENUM"}:
-        # Declarative setup metadata is intentionally non-numeric. It belongs
-        # to generated-route builders and UI summaries, never to Blender's
-        # scalar driver-expression namespace.
-        return str(raw_value)
     if kind == "COLOR":
         # A colour is three numbers behind one swatch. It never substitutes as
         # itself - expand_colour_tokens() turns it into <token>R/G/B, which is
@@ -277,29 +241,6 @@ def default_values(template):
     return {param["token"]: param.get("default", 0.0) for param in template.get("params", [])}
 
 
-def format_result_summary(template, values, scene):
-    """Describe the selected parameter result in user-facing units.
-
-    Summary strings are catalogue metadata, not executable expressions. Values
-    still pass through the same coercion rules as expression generation so the
-    sentence always describes what Blender will actually receive.
-    """
-    summary = template.get("result_summary", "")
-    if not summary:
-        return ""
-    merged = default_values(template)
-    merged.update(values or {})
-    resolved = {
-        param["token"]: coerce_value(param, merged[param["token"]])
-        for param in template.get("params", [])
-    }
-    resolved.update({key: float(value) for key, value in frame_constants(template, scene).items()})
-    try:
-        return summary.format_map(resolved)
-    except (KeyError, ValueError):
-        return ""
-
-
 def advanced_defaults(template, scene):
     # Start/End default to 0, which the activation-window helper reads as
     # "use the scene boundary". This keeps untouched advanced timing controls
@@ -312,8 +253,6 @@ def advanced_defaults(template, scene):
         "ADV_LOOP_FIT": 0,
         "ADV_MULT": 1.0,
         "ADV_OFFSET": 0.0,
-        "ADV_OVERRIDE_FPS": 0,
-        "ADV_TIMING_FPS": 24.0,
     }
     resolved = {}
     for control in template.get("advanced_controls", []):
@@ -388,18 +327,13 @@ def fit_period_to_scene_loop(frame_length, desired_period):
     return frame_length / repeats
 
 
-def evaluate_expression_at_frame(expression, template, frame, helper_expressions=None):
-    code = _cached_compile(expression, "<driver_espresso_eval>")
+def evaluate_expression_at_frame(expression, template, frame):
+    code = _parsed(expression, "<expression>")
     namespace = dict(SAFE_NAMESPACE)
     for variable in _driver_variable_specs(template):
         namespace[variable["name"]] = variable.get("preview_default", 0)
     namespace["frame"] = frame
-    for helper in helper_expressions or ():
-        namespace[helper["name"]] = eval(
-            _cached_compile(helper["expression"], "<driver_espresso_helper_eval>"),
-            {"__builtins__": {}}, namespace,
-        )
-    value = eval(code, {"__builtins__": {}}, namespace)
+    value = code(namespace)
     if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
         raise ValueError(f"non-numeric value at frame {frame!r}")
     return float(value)
@@ -410,8 +344,8 @@ def _format_literal(value):
 
 
 _format_driver_literal = format_driver_literal
-# Calculated values only - see format_computed_literal for why measured
-# anchors must not go through it.
+# Calculated values only; measured anchors must not go through it (see
+# format_computed_literal).
 _format_computed_literal = format_computed_literal
 
 
@@ -477,32 +411,22 @@ class _PowAndModToCalls(_PowToCall):
 def _use_driver_fast_path(expression):
     """Swap ``**`` for ``pow()`` so Blender can use its fast driver evaluator.
 
-    Blender compiles a driver to bytecode (``BLI_expr_pylike``) only when the
-    expression stays inside a supported subset; anything else falls back to full
-    Python evaluation, which is far slower and serialised on the GIL. Measured
-    against Blender 5.1, the only unsupported things this catalogue used were
-    ``**``, ``%`` and ``tanh`` - everything else (trig, floor, ternaries, clamp,
-    lerp, comparisons) is already fast.
-
-    Measured on 300 drivers over 120 frames: 354 ms on the Python path versus
-    53 ms on the fast one, a 6.7x difference.
-
-    Both rewrites preserve values exactly, so this is purely an evaluator-speed
-    change. That also makes it safe to *skip*: the modulo rewrite spends about
-    14 characters per ``%`` and some templates already sit within a couple of
-    characters of Blender's 255-character driver ceiling, where being correct
-    but slow beats not applying at all. ``**`` is always rewritten because
-    ``pow()`` is no longer than the operator it replaces.
-
-    Only expressions actually containing ``**`` or ``%`` are re-parsed, keeping
-    the blast radius off templates that are already fast.
+    Blender compiles a driver to bytecode only when the expression stays inside a
+    supported subset; anything else falls back to full Python evaluation, which is much
+    slower and serialised on the GIL. The only unsupported constructs this catalogue
+    used were ``**``, ``%`` and ``tanh``. Both rewrites preserve values exactly, so this
+    changes evaluator speed only. That also makes the modulo rewrite safe to skip: it
+    costs about 14 characters per ``%`` and some templates sit within a couple of
+    characters of the 255-character driver limit, where being correct but slow beats not
+    applying. ``**`` is always rewritten because ``pow()`` is no longer than the
+    operator it replaces. Only expressions containing ``**`` or ``%`` are re-parsed.
     """
     has_pow, has_mod = "**" in expression, "%" in expression
     if not (has_pow or has_mod):
         return expression
 
     def rendered(transformer):
-        tree = transformer.visit(ast.parse(expression, mode="eval"))
+        tree = transformer.visit(formula_reader.parse_expression(expression))
         ast.fix_missing_locations(tree)
         return ast.unparse(tree)
 
@@ -587,7 +511,7 @@ def _split_trailing_numeric_constant(expression):
     if _strip_redundant_outer_parentheses(expression) != expression:
         return expression, None
     try:
-        root = ast.parse(expression, mode="eval").body
+        root = formula_reader.parse_expression(expression)
     except SyntaxError:
         return expression, None
     if not isinstance(root, ast.BinOp) or not isinstance(root.op, (ast.Add, ast.Sub)):
@@ -595,7 +519,7 @@ def _split_trailing_numeric_constant(expression):
     # The sign in `value+-0` belongs to a unary literal, not the outer
     # addition. Regex splitting left a dangling '+' in valid eye recipes.
     try:
-        constant = ast.literal_eval(root.right)
+        constant = formula_reader.literal(root.right)
     except (ValueError, TypeError, SyntaxError):
         return expression, None
     if type(constant) not in (int, float):
@@ -610,7 +534,7 @@ def _split_affine_output_bias(expression):
     """Extract constant output bias through scalar gain, never nonlinear ops."""
     def number(node):
         try:
-            value = ast.literal_eval(node)
+            value = formula_reader.literal(node)
             return float(value) if type(value) in (int, float) else None
         except (ValueError, TypeError, SyntaxError):
             return None
@@ -626,14 +550,14 @@ def _split_affine_output_bias(expression):
             return ast.BinOp(left=dynamic, op=ast.Mult(), right=node.right), bias * right
         return dynamic, bias + right * (-1 if isinstance(node.op, ast.Sub) else 1)
 
-    root = ast.parse(expression, mode="eval").body
+    root = formula_reader.parse_expression(expression)
     dynamic, bias = split(root)
     return _compact_generated_expression(ast.unparse(dynamic)), bias
 
 
 def _has_top_level_conditional(expression):
     try:
-        return isinstance(ast.parse(expression, mode="eval").body, ast.IfExp)
+        return isinstance(formula_reader.parse_expression(expression), ast.IfExp)
     except SyntaxError:
         return True
 
@@ -655,7 +579,7 @@ def _apply_output_clamp(expression, state):
             # Rest wrapping adds protective parentheses at each stage.
             # Re-render their syntax tree to remove only redundant grouping.
             expression = _compact_generated_expression(
-                ast.unparse(ast.parse(expression, mode="eval")),
+                ast.unparse(formula_reader.parse_expression(expression)),
             )
         except (SyntaxError, ValueError, RecursionError):
             pass  # Validation reports the original malformed expression.
@@ -708,7 +632,7 @@ def capture_rest_start_state(
             # Tolerate the pair arriving the wrong way round rather than
             # producing max(20,min(0,x)), which pins the output to a constant.
             state["clamp_min"], state["clamp_max"] = min(low, high), max(low, high)
-        if profile in {"BOUNDED_MIN", "BOUNDED_MAX"}:
+        if profile == "BOUNDED_MIN":
             origin_value, sampled_min, sampled_max = additive_origin_values(
                 expression,
                 template,
@@ -718,17 +642,13 @@ def capture_rest_start_state(
                 int(getattr(scene, "frame_end", 250)),
                 origin,
             )
-            if profile == "BOUNDED_MIN":
-                actual_span = max(1e-12, sampled_max - origin_value)
-                semantic_span = max(0.0, sampled_max - float(output_baseline or 0.0))
-            else:
-                actual_span = max(1e-12, origin_value - sampled_min)
-                semantic_span = max(0.0, float(output_baseline or 0.0) - sampled_min)
+            actual_span = max(1e-12, sampled_max - origin_value)
+            semantic_span = max(0.0, sampled_max - float(output_baseline or 0.0))
             state["bounded_gain"] = semantic_span / actual_span if semantic_span else 1.0
         return state
     if mode == REST_START_OFFSET_ONLY:
         profile = additive_profile or resolve_additive_profile(template)
-        if profile in {"BOUNDED_MIN", "BOUNDED_MAX"}:
+        if profile == "BOUNDED_MIN":
             semantic_bound = output_baseline
             if semantic_bound is None:
                 semantic_bound = resolve_output_baseline(template, default_values(template))
@@ -757,107 +677,73 @@ def wrap_expression_with_rest_state(expression, template, state):
         snapshot_frame = int(state.get("snapshot_frame", 1))
         rest_value = float(state.get("rest_value", 0.0))
         profile = state.get("additive_profile") or resolve_additive_profile(template)
-        if profile == "STATIC_UTILITY":
-            return expression
         rest_literal = _format_driver_literal(rest_value)
-        delta = None
-        if profile == "INPUT_RELATIVE":
-            baseline = _normalize_zero(state.get("output_baseline", 0.0))
-            excursion = f"({expression})"
-            if not _is_positive_zero(baseline):
-                excursion += f"-{_format_driver_literal(baseline)}"
+        origin = float(state.get("phase_origin", 0.0))
+        shift = origin - snapshot_frame
+        scene_start = float(state.get("scene_start", 1.0))
+        frame_count = len(re.findall(r"\bframe\b", expression))
+        localized = expression
+        optimized = False
+        if abs(origin - scene_start) <= 1e-12 and frame_count:
+            start_literal = _format_driver_literal(scene_start)
+            localized, replacements = re.subn(
+                rf"\bframe\s*-\s*{re.escape(start_literal)}\b",
+                f"frame-{snapshot_frame}",
+                expression,
+            )
+            optimized = replacements == frame_count
+        if optimized:
+            pass
+        elif abs(shift) <= 1e-12:
+            localized = expression
+        elif shift > 0:
+            localized = re.sub(r"\bframe\b", f"(frame+{_format_driver_literal(shift)})", expression)
+        else:
+            localized = re.sub(r"\bframe\b", f"(frame-{_format_driver_literal(abs(shift))})", expression)
+        localized = _compact_localized_frame_arithmetic(localized)
+        reference = _normalize_zero(
+            evaluate_expression_at_frame(expression, template, origin)
+        )
+        dynamic_localized, trailing_constant = _split_trailing_numeric_constant(localized)
+        if len(localized) > 190:
+            # Stress-sized channels can carry a bias inside an
+            # amplitude multiplier and another outside it. Both
+            # cancel under rest subtraction; collect them before
+            # generating the final bounded-length driver string.
+            dynamic_localized, trailing_constant = _split_affine_output_bias(localized)
+        if trailing_constant is not None:
+            # Remove a shared output bias before subtracting the
+            # sampled reference, including nonzero excursions.
+            # (motion + bias) - reference == motion - (reference-bias).
+            # This also prevents large biases wasting driver space.
+            localized = dynamic_localized
+            reference = _normalize_zero(reference - trailing_constant)
+        reference_literal = _format_computed_literal(reference)
+        if profile == "BOUNDED_MIN":
+            gain_value = float(state.get("bounded_gain", 1.0))
+            localized = _strip_redundant_outer_parentheses(localized)
+            excursion = f"max(0,({localized})"
+            if reference > 0.0:
+                excursion += f"-{reference_literal}"
+            elif reference < 0.0:
+                excursion += f"+{_format_driver_literal(abs(reference))}"
+            excursion += ")"
+            if gain_value != 1.0:
+                excursion += f"*{_format_computed_literal(gain_value)}"
             delta = excursion
             active = excursion if _is_positive_zero(rest_value) else f"{rest_literal}+{excursion}"
         else:
-            origin = float(state.get("phase_origin", 0.0))
-            shift = origin - snapshot_frame
-            scene_start = float(state.get("scene_start", 1.0))
-            frame_count = len(re.findall(r"\bframe\b", expression))
-            localized = expression
-            optimized = False
-            if abs(origin - scene_start) <= 1e-12 and frame_count:
-                start_literal = _format_driver_literal(scene_start)
-                localized, replacements = re.subn(
-                    rf"\bframe\s*-\s*{re.escape(start_literal)}\b",
-                    f"frame-{snapshot_frame}",
-                    expression,
-                )
-                optimized = replacements == frame_count
-            if optimized:
-                pass
-            elif abs(shift) <= 1e-12:
-                localized = expression
-            elif shift > 0:
-                localized = re.sub(r"\bframe\b", f"(frame+{_format_driver_literal(shift)})", expression)
+            if _is_positive_zero(reference) and not _has_top_level_conditional(localized):
+                excursion = localized
             else:
-                localized = re.sub(r"\bframe\b", f"(frame-{_format_driver_literal(abs(shift))})", expression)
-            localized = _compact_localized_frame_arithmetic(localized)
-            reference = _normalize_zero(
-                evaluate_expression_at_frame(expression, template, origin)
-            )
-            if profile in {
-                "BOUNDED_MIN", "BOUNDED_MAX", "CENTERED_ZERO",
-                "ONE_SHOT_REST", "ELAPSED_TIME",
-            }:
-                dynamic_localized, trailing_constant = _split_trailing_numeric_constant(localized)
-                if len(localized) > 190:
-                    # Stress-sized channels can carry a bias inside an
-                    # amplitude multiplier and another outside it. Both
-                    # cancel under rest subtraction; collect them before
-                    # generating the final bounded-length driver string.
-                    dynamic_localized, trailing_constant = _split_affine_output_bias(localized)
-                if trailing_constant is not None:
-                    # Remove a shared output bias before subtracting the
-                    # sampled reference, including nonzero excursions.
-                    # (motion + bias) - reference == motion - (reference-bias).
-                    # This also prevents large biases wasting driver space.
-                    localized = dynamic_localized
-                    reference = _normalize_zero(reference - trailing_constant)
-            reference_literal = _format_computed_literal(reference)
-            if profile == "BOUNDED_MIN":
-                gain_value = float(state.get("bounded_gain", 1.0))
-                localized = _strip_redundant_outer_parentheses(localized)
-                excursion = f"max(0,({localized})"
-                if reference > 0.0:
-                    excursion += f"-{reference_literal}"
-                elif reference < 0.0:
-                    excursion += f"+{_format_driver_literal(abs(reference))}"
-                excursion += ")"
-                if gain_value != 1.0:
-                    excursion += f"*{_format_computed_literal(gain_value)}"
-                delta = excursion
-                active = excursion if _is_positive_zero(rest_value) else f"{rest_literal}+{excursion}"
-            elif profile == "BOUNDED_MAX":
-                gain_value = float(state.get("bounded_gain", 1.0))
-                if _is_positive_zero(reference):
-                    excursion = f"max(0,-({localized}))"
-                else:
-                    excursion = f"max(0,{reference_literal}-({localized}))"
-                if gain_value != 1.0:
-                    excursion += f"*{_format_computed_literal(gain_value)}"
-                delta = f"-{excursion}"
-                active = f"-{excursion}" if _is_positive_zero(rest_value) else f"{rest_literal}-{excursion}"
-            elif profile == "RELATIVE_SCALE":
-                # Scale kernels are authored around a non-zero multiplicative
-                # rest (normally 1). The epsilon only protects malformed custom
-                # expressions; catalogue contracts never rely on it.
-                denominator = max(1e-12, abs(reference))
-                numerator = f"({localized})"
-                if rest_value != 1.0:
-                    numerator = f"{rest_literal}*{numerator}"
-                active = numerator if denominator == 1.0 else f"{numerator}/{_format_driver_literal(denominator)}"
-            else:
-                if _is_positive_zero(reference) and not _has_top_level_conditional(localized):
-                    excursion = localized
-                else:
-                    excursion = f"({localized})"
-                if not _is_positive_zero(reference):
-                    excursion += f"-{reference_literal}"
-                delta = excursion
-                active = excursion if _is_positive_zero(rest_value) else f"{rest_literal}+{excursion}"
+                excursion = f"({localized})"
+            if not _is_positive_zero(reference):
+                excursion += f"-{reference_literal}"
+            delta = excursion
+            active = excursion if _is_positive_zero(rest_value) else f"{rest_literal}+{excursion}"
         if _is_positive_zero(rest_value):
             return _apply_output_clamp(f"frame>{snapshot_frame} and {active}", state)
-        if rest_value != 0.0 and delta is not None:
+        if rest_value != 0.0:
             return _apply_output_clamp(
                 f"{rest_literal}+(frame>{snapshot_frame} and {delta})", state
             )
@@ -887,10 +773,7 @@ def _evaluate_baseline_contract(explicit, token_values):
             baseline_expression,
         )
     try:
-        value = eval(
-            compile(baseline_expression, "<driver_espresso_baseline>", "eval"),
-            {"__builtins__": {}}, dict(SAFE_NAMESPACE),
-        )
+        value = formula_reader.parse(baseline_expression)(dict(SAFE_NAMESPACE))
         return float(value)
     except Exception:
         return None
@@ -906,10 +789,10 @@ def resolve_output_baseline(template, token_values, channel=None):
         return evaluated
     if template.get("data_path") == "scale":
         return 1.0
-    # START and A are deliberately absent: both have represented timeline/input
-    # values as well as output anchors. Current legitimate uses are explicit in
-    # catalogue_contracts.BASELINE_OVERRIDES, preventing the original collision
-    # from silently returning in a future recipe.
+    # START and A are deliberately absent: both represent timeline or input values as
+    # well as output anchors. Their legitimate uses are explicit in
+    # catalogue_contracts.BASELINE_OVERRIDES, which keeps the original collision from
+    # returning in a future recipe.
     for token in ("MIN", "CENTER", "BASE", "REST", "LOW", "OUT_MIN"):
         if token in token_values:
             return float(token_values[token])
@@ -929,7 +812,7 @@ def resolve_additive_profile(template, channel=None):
 def _search_additive_origin(expression, template_id, profile, output_baseline, start, end, variables):
     namespace = dict(SAFE_NAMESPACE)
     namespace.update(dict(variables))
-    code = compile(expression, "<driver_espresso_additive_origin>", "eval")
+    code = formula_reader.parse(expression)
     # Search a long deterministic horizon. BOUNDED_MIN is clamped against any
     # later undershoot by the wrapper, so this chooses a useful start phase
     # without pretending every mixed-frequency kernel has a short exact period.
@@ -941,15 +824,13 @@ def _search_additive_origin(expression, template_id, profile, output_baseline, s
     for frame in range(start, start + horizon + 1):
         namespace["frame"] = frame
         try:
-            value = float(eval(code, {"__builtins__": {}}, namespace))
+            value = float(code(namespace))
         except Exception:
             continue
         sampled_min = min(sampled_min, value)
         sampled_max = max(sampled_max, value)
         if profile == "BOUNDED_MIN":
             score = value
-        elif profile == "BOUNDED_MAX":
-            score = -value
         else:
             score = abs(value - output_baseline)
         if score < best_score:
@@ -959,7 +840,7 @@ def _search_additive_origin(expression, template_id, profile, output_baseline, s
 
 
 def find_additive_origin(expression, template, profile, output_baseline, scene_start, scene_end):
-    if profile in {"ONE_SHOT_REST", "ELAPSED_TIME", "INPUT_RELATIVE", "STATIC_UTILITY"}:
+    if profile == "ONE_SHOT_REST":
         return float(scene_start)
     variables = tuple(
         sorted(
@@ -1001,8 +882,6 @@ def _prepare_expression_tokens(template, values, scene):
     for param in template.get("params", []):
         token = param["token"]
         value = coerce_value(param, merged.get(token, param.get("default", 0.0)))
-        if param.get("type") in {"STRING", "ENUM"}:
-            continue
         if param.get("type") == "COLOR":
             # A swatch is three numbers wearing one control. Only the components
             # are ever named by an expression, so ONLY those enter token_values -
@@ -1019,16 +898,14 @@ def _prepare_expression_tokens(template, values, scene):
         value = coerce_value(control, merged.get(token, control.get("default", 0.0)))
         token_values[token] = value
 
-    # Only these tokens were chosen by the artist - a slider they dragged or a
-    # preset they picked. Everything merged in after this point (frame
-    # constants, derives output) is machine-computed and must not be rounded
-    # for "readability": nobody reads FRAME_LEN or a template's internal rate
-    # constant on a UI, and rounding one has already caused two real bugs -
-    # a divide-by-zero guard erased and a clock hand's tick
-    # rate drifting audibly over a long scene. A template that DOES want a
-    # short literal from a derived value (e.g. a pre-converted radian angle,
-    # to stay under the 255-character driver limit) can round(...) inside its
-    # own derives formula - opt-in per template, not silently system-wide.
+    # Only these tokens were chosen by the artist (a slider they dragged or a preset
+    # they picked). Everything merged in after this point (frame constants, derives
+    # output) is machine-computed and must not be rounded for readability: nobody reads
+    # FRAME_LEN or a template's internal rate constant in the UI, and rounding one would
+    # erase a divide-by-zero guard or make a clock hand's tick rate drift over a long
+    # scene. A template that wants a short literal from a derived value (a pre-converted
+    # radian angle, to stay under the 255-character driver limit) can ``round(...)``
+    # inside its own derives formula; that is opt-in per template, not system-wide.
     _artist_chosen_tokens = frozenset(token_values)
 
     from ...catalogue import catalogue_contracts
@@ -1050,14 +927,6 @@ def _prepare_expression_tokens(template, values, scene):
 
     token_values.update(frame_constants(template, scene))
 
-    if "ADV_OVERRIDE_FPS" in token_values and "ADV_TIMING_FPS" in token_values:
-        token_values["EFFECTIVE_FPS"] = (
-            token_values["ADV_TIMING_FPS"]
-            if token_values["ADV_OVERRIDE_FPS"]
-            else token_values["FPS"]
-        )
-        token_values["FPS_SCALE"] = 24.0 / max(1e-9, token_values["EFFECTIVE_FPS"])
-
     # Friendly parameters resolve here: after the frame constants exist (they may
     # be needed by the formulas) and before any token is substituted. A no-op for
     # every template that declares no `derives`.
@@ -1074,17 +943,12 @@ def _prepare_expression_tokens(template, values, scene):
         for token, value in token_values.items()
     }
 
-    # AFTER rounding, deliberately. This guard stops an input range of zero
-    # width from emitting a literal `/0`, which errors in Blender and stops the
-    # property animating. It runs after the rounding pass, because rounding
-    # would undo it: IN_MAX is an artist-chosen token, so a nudged value of 1 +
-    # 1e-6 would round straight back to 1 and the divide-by-zero would return.
-    # Only INT ranges survived, because their step of 1 is too big to round
-    # away.
-    #
-    # Running last also catches the case the old placement could never see: an
-    # artist entering 1.0 and 1.000001 has a valid range going in, and it is
-    # ROUNDING that collapses the two to the same number.
+    # Runs after the rounding pass, deliberately. This guard stops an input range of
+    # zero width from emitting a literal ``/0``, which errors in Blender and stops the
+    # property animating. Rounding would undo it: IN_MAX is an artist-chosen token, so a
+    # nudged value of 1 + 1e-6 would round straight back to 1. Running last also catches
+    # an artist entering 1.0 and 1.000001 when rounding collapses the two to the same
+    # number.
     if "IN_MIN" in token_values and "IN_MAX" in token_values:
         if token_values["IN_MAX"] <= token_values["IN_MIN"]:
             specs = {param["token"]: param for param in template.get("params", [])}
@@ -1094,15 +958,6 @@ def _prepare_expression_tokens(template, values, scene):
             )
             token_values["IN_MAX"] = token_values["IN_MIN"] + step
             warnings.append("Input maximum was adjusted to stay above input minimum.")
-
-    for constraint in template.get("constraints", ()):
-        if constraint.get("kind") != "phase_budget":
-            continue
-        total_token = constraint["total"]
-        required = sum(max(0, token_values.get(token, 0)) for token in constraint["parts"])
-        if token_values.get(total_token, 0) < required:
-            token_values[total_token] = required
-            warnings.append(constraint["message"].format(required=int(required)))
 
     return token_values, warnings
 
@@ -1128,11 +983,9 @@ def _emit_expression(
     expression = template["expression"]
     if "ADV_DELAY" in token_values or "ADV_ADVANCE" in token_values:
         expression = apply_advanced_time(expression, token_values)
-    # One compiled alternation instead of one re.sub per token. The alternation
-    # is built LONGEST-FIRST, exactly as the old loop was ordered, so a short
-    # token can never consume part of a longer one. Verified byte-identical
-    # across 665 build cases. The pattern is cached on the token NAMES (fixed
-    # per template); only the values change between calls.
+    # One compiled alternation instead of one ``re.sub`` per token, built longest-first
+    # so a short token can never consume part of a longer one. The pattern is cached on
+    # the token names (fixed per template); only the values change between calls.
     pattern = _token_pattern(tuple(sorted(token_values, key=len, reverse=True)))
     if pattern is not None:
         literals = prepared_literals or {
@@ -1141,10 +994,9 @@ def _emit_expression(
         }
         expression = pattern.sub(lambda m: literals[m.group(0)], expression)
     expression = _compact_generated_expression(expression)
-    # Only these two calls can change the expression after the first
-    # compaction, so when neither fires the second pass is pure cost
-    # (_compact_generated_expression is idempotent). Verified output-identical
-    # across 1,561 build cases with advanced controls both off and on.
+    # Only these two calls can change the expression after the first compaction, so when
+    # neither fires the second pass is pure cost (``_compact_generated_expression`` is
+    # idempotent).
     wrapped = False
     if any(token in token_values for token in ("ADV_DELAY", "ADV_START_FRAME", "ADV_END_FRAME")):
         candidate = wrap_activation_window(expression, token_values, scene, output_baseline)
@@ -1204,7 +1056,6 @@ def build_template_expressions(template, values, scene):
             token: _format_driver_literal(value)
             for token, value in token_values.items()
         }
-    helper_expressions = []
     built = []
     for channel in channels:
         channel_template = dict(template)
@@ -1233,30 +1084,29 @@ def build_template_expressions(template, values, scene):
             item["warnings"].extend(driver_warnings)
         item["output_baseline"] = details["output_baseline"]
         item["additive_profile"] = resolve_additive_profile(template, channel)
-        if helper_expressions:
-            item["internal_helpers"] = helper_expressions
         built.append(item)
     return built
 
 
 def _driver_variable_specs(template):
-    """Variables available while validating both public and helper drivers."""
+    """Variables available while validating a driver expression."""
     return [
         *list((template or {}).get("requires_driver_variables", [])),
-        *list((template or {}).get("managed_driver_variables", [])),
     ]
 
 
 def _names_in_expression(expression):
-    tree = ast.parse(expression, mode="eval")
+    tree = formula_reader.parse_expression(expression)
     return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
 
 
 def validate_expression(expression, template=None, scene=None):
     try:
-        code = compile(expression, "<driver_espresso>", "eval")
+        code = formula_reader.parse(expression)
     except SyntaxError as exc:
         return False, f"Syntax error: {exc.msg}"
+    except ValueError as exc:
+        return False, f"Unsupported expression: {exc}"
 
     required = {var["name"] for var in _driver_variable_specs(template)}
     try:
@@ -1277,7 +1127,7 @@ def validate_expression(expression, template=None, scene=None):
     try:
         for frame in frames:
             namespace["frame"] = frame
-            value = eval(code, {"__builtins__": {}}, namespace)
+            value = code(namespace)
             if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                 return False, f"Non-finite value at frame {frame}"
     except Exception as exc:
@@ -1375,12 +1225,11 @@ def get_active_driver_fcurve(context):
     if driver is not None:
         return fcurve, driver, ""
 
-    # Driver Espresso's panel is usually drawn from the 3D Viewport sidebar,
-    # whose context never carries active_editable_fcurve /
-    # selected_editable_fcurves at all — those only exist inside a Graph
-    # Editor or Drivers Editor context. Scan any Graph Editor area open on
-    # this screen directly via a context override so selection made there is
-    # still picked up regardless of which editor's N-panel is showing.
+    # The panel is usually drawn from the 3D Viewport sidebar, whose context never
+    # carries ``active_editable_fcurve`` or ``selected_editable_fcurves``; those exist
+    # only inside a Graph Editor or Drivers Editor context. Any Graph Editor area open
+    # on this screen is scanned directly through a context override, so a selection made
+    # there is picked up whichever editor's N-panel is showing.
     screen = getattr(context, "screen", None)
     if screen is not None:
         for area in screen.areas:
@@ -1447,31 +1296,6 @@ def list_object_driver_fcurves(obj):
     return [fcurve for fcurve in anim.drivers if getattr(fcurve, "driver", None) is not None]
 
 
-_INDEXED_DATA_PATH_RE = re.compile(r'^(.*)\[(-?\d+)\]$')
-
-
-def resolve_variable_ui_binding(target):
-    """For a driver-variable SINGLE_PROP target, return ``(id_data, prop_path,
-    index)`` suitable for ``layout.prop(id_data, prop_path, index=index)`` (or
-    without ``index`` when it's ``-1``), or ``None`` if the target isn't wired
-    to anything the UI can bind a live control to.
-
-    Handles the common shapes: a custom property (``["name"]`` — what Setup
-    Missing Variables creates), an indexed array component (``location[0]``),
-    or a plain scalar attribute.
-    """
-    id_data = getattr(target, "id", None)
-    data_path = getattr(target, "data_path", "") or ""
-    if id_data is None or not data_path:
-        return None
-    if data_path.startswith('["') and data_path.endswith('"]'):
-        return id_data, data_path, -1
-    match = _INDEXED_DATA_PATH_RE.match(data_path)
-    if match:
-        return id_data, match.group(1), int(match.group(2))
-    return id_data, data_path, -1
-
-
 def set_active_driver_target(context, owner_or_descriptor, data_path="", array_index=-1):
     props = getattr(getattr(context, "scene", None), "espresso_props", None)
     if props is None or owner_or_descriptor is None:
@@ -1507,30 +1331,24 @@ def clear_active_driver_target(props):
 
 
 def get_target_driver_fcurve(context, fcurves=None, targets=None):
-    """Resolve "the driver to act on", preferring an explicit pick made via
-    the Driver Target picker over Drivers-Editor selection state.
+    """Resolve "the driver to act on", preferring an explicit pick made in the Driver
+    Target picker over Drivers Editor selection.
 
     Priority order:
-    1. If the picker feature is disabled (addon preference), skip straight to
-       get_active_driver_fcurve — a full bypass, unchanged legacy behavior.
-    2. An explicit pick (active_target_owner/data_path/index on
-       espresso_props) that still resolves to a real driver on the current
-       active object.
-    3. If the active object has exactly one driver, there's nothing
-       ambiguous about it — use it. This covers switching to a different
-       object after a pick was made elsewhere: the stored pick (e.g. an
-       owner name from a previously-selected object) won't match step 2, but
-       there's still only one sane candidate on the object in front of you.
-       With 2+ drivers this is skipped and an explicit picker-row click is
-       still required, since guessing which one risks acting on the wrong
-       property.
-    4. Fall back to get_active_driver_fcurve (Drivers-Editor selection
-       detection, unchanged).
 
-    `fcurves`, if given, is used as the candidate list for steps 2-3 instead
-    of re-enumerating the active object's drivers — callers that already
-    have that list (e.g. a panel drawing every driver as a row) can pass it
-    in to avoid scanning the object's drivers twice per redraw.
+    1. If the picker is disabled (add-on preference), go straight to
+       ``get_active_driver_fcurve``.
+    2. An explicit pick (active_target_owner/data_path/index on espresso_props) that
+       still resolves to a real driver on the active object.
+    3. If the active object has exactly one driver, use it. This covers switching
+       objects after a pick was made elsewhere: the stored pick will not match, but
+       there is one sensible candidate. With two or more drivers it is skipped and a
+       picker-row click is required, since guessing risks acting on the wrong property.
+    4. Fall back to ``get_active_driver_fcurve`` (Drivers Editor selection).
+
+    ``fcurves``, if given, is the candidate list for steps 2-3 instead of re-enumerating
+    the active object's drivers, so a caller that already has the list (a panel drawing
+    every driver as a row) avoids scanning twice per redraw.
     """
     if not driver_target_picker_enabled(context):
         return get_active_driver_fcurve(context)
@@ -1599,17 +1417,12 @@ RECOMMENDED_SUFFIX = " (Recommended)"
 
 
 def mark_recommended(items, recommended_id):
-    """Label the shipped default in an enum list so it can be found again.
-
-    Blender shows no hint of which value a property started with, so a user who
-    changes one of these has no way back short of resetting every preference.
-    These are all judgement calls rather than obvious ones, which is exactly
-    when knowing the intended answer matters.
-
-    Derived from the identifier the property actually defaults to, rather than
-    hand-written into each label, so the mark cannot drift away from the real
-    default. Item tuples may carry an icon and index after the description, so
-    the tail is preserved as-is.
+    """Label the shipped default in an enum list so it can be found again. Blender shows
+    no hint of which value a property started with, so a user who changes one of
+    these has no way back short of resetting every preference. The mark is derived
+    from the identifier the property actually defaults to, so it cannot drift from
+    the real default. Item tuples may carry an icon and index after the description;
+    that tail is preserved as-is.
     """
     marked = []
     for item in items:

@@ -7,7 +7,6 @@ import json
 import bpy
 
 from ...catalogue import browse_groups
-from ...apply import colour_ramp, light_layout
 from ...apply.setups import parameter_bindings
 from ...catalogue import templates
 from ...engine import utils
@@ -22,12 +21,6 @@ def _visualizer_style_items():
     from ..views import visualizer
 
     return [(sid, label, desc) for sid, label, desc in visualizer.STYLE_ITEMS]
-
-
-def _preview_mode_items():
-    from ..views import preview_modes
-
-    return [(ident, label, desc) for ident, label, desc in preview_modes.MODE_ITEMS]
 
 
 def _rest_start_mode_items():
@@ -102,17 +95,14 @@ def _collect_proxy_safe_token_specs():
     }
 
 
-# Blender requires that EnumProperty item callbacks keep a Python reference to
-# the returned strings; otherwise the items can be garbage collected, corrupting
-# the menu text or crashing. These module-level caches hold the most recent
-# results so their strings stay alive while Blender uses them.
+# Blender requires that EnumProperty item callbacks keep a Python reference to the
+# returned strings; otherwise the items can be garbage collected, corrupting the menu
+# text or crashing. These module-level caches hold the most recent results so the
+# strings stay alive while Blender uses them.
 #
-# They are also keyed, because Blender calls these callbacks on every redraw of
-# the menu - measured at a dozen calls per panel redraw. Recomputing meant
-# re-filtering the whole catalogue and rebuilding every description string each
-# time, for a result that only changes when the category, browse group or search
-# text does. Keying keeps the returned list identical (so the strings stay
-# alive) while skipping the work.
+# They are keyed because Blender calls these callbacks many times per panel redraw, and
+# recomputing would re-filter the whole catalogue and rebuild every description string
+# for a result that only changes when the category, browse group or search text does.
 _CATEGORY_ITEMS_CACHE = []
 _CATEGORY_ITEMS_KEY = None
 _BROWSE_GROUP_ITEMS_CACHE = []
@@ -121,13 +111,9 @@ _TEMPLATE_ITEMS_CACHE = []
 _TEMPLATE_ITEMS_KEY = None
 
 
-# These label CATEGORIES, so they must read as a description of a CONTAINER.
-# "Encodes one calibrated real-world behaviour" is true of a template and false
-# of a category - Light & Flicker holds dozens - and even leading with "each
-# template" still parsed as a claim about the category itself. Hence the shape
-# used here: name the category, say it HOLDS SEVERAL templates, and only then
-# describe what one of them is. Avoid "shelf" too; the UI calls it a Category,
-# so the tooltip should use the user's word, not ours.
+# These label categories, so they must read as a description of a container: name the
+# category, say it holds several templates, and only then describe what one of them is.
+# The UI calls it a Category, so the tooltip uses that word.
 GENERIC_TIP = "Generic category - holds several templates, each one a raw shape that you give the meaning to"
 TAILORED_TIP = "Tailored category - holds several templates, each one calibrated to a real-world behaviour, with parameters named for it"
 
@@ -193,12 +179,11 @@ TEMPLATE_KIND_ITEMS = [
 def on_template_kind_update(self, context):
     """Keep the selected category valid when the filter hides it."""
     categories = list(templates.CATEGORIES)
-    # Read the RAW stored value rather than self.category. A dynamic enum
-    # resolves through its items callback on every read, and by this point the
-    # callback already reflects the NEW filter - so reading the property while
-    # the old category is still selected makes Blender log
-    # "current value 'N' matches no enum". get() returns the stored index
-    # without that round trip, and therefore without the warning.
+    # Read the raw stored value rather than self.category. A dynamic enum resolves
+    # through its items callback on every read, and by this point the callback already
+    # reflects the new filter, so reading the property while the old category is still
+    # selected makes Blender log "current value 'N' matches no enum". ``get()`` returns
+    # the stored index without that round trip.
     stored = self.get("category")
     if isinstance(stored, int) and 0 <= stored < len(categories):
         current = categories[stored]
@@ -232,39 +217,6 @@ def browse_group_items(self, _context):
     return _BROWSE_GROUP_ITEMS_CACHE
 
 
-def _collapse_channel_sets(matches, active_id):
-    """Show one entry per channel set, not every member.
-
-    Police A and B are two channels of one setup, so the template list carries a
-    single representative and the panel's channel picker switches between them.
-    The representative is the active member when one is selected (so the enum
-    value stays valid), otherwise the first by role order.
-    """
-    seen_sets = set()
-    collapsed = []
-    for item in matches:
-        role_set = item.get("role_set")
-        if not role_set:
-            collapsed.append(item)
-            continue
-        if role_set in seen_sets:
-            continue
-        seen_sets.add(role_set)
-        siblings = templates.channel_siblings(item)
-        # The representative has to be a member of THIS pool. A search for
-        # "hand" matches Lens: Dolly Zoom alone ("move the camera by hand");
-        # answering with the set's first member, Focus Distance, put the
-        # arrows on a template the search never listed.
-        present = {member["id"] for member in matches}
-        active = next(
-            (s for s in siblings if s["id"] == active_id and s["id"] in present),
-            None,
-        )
-        first_present = next((s for s in siblings if s["id"] in present), item)
-        collapsed.append(active or first_present)
-    return collapsed
-
-
 SEARCH_RESULT_ROW_LIMIT = 5
 
 
@@ -273,11 +225,7 @@ def search_result_templates(props):
     query = getattr(props, "search_text", "") or ""
     if not query:
         return []
-    matches = _catalogue_stage_filter(
-        props,
-        templates.search_templates(query, getattr(props, "category", None)),
-    )
-    return _collapse_channel_sets(matches, getattr(props, "last_template_id", ""))
+    return templates.search_templates(query, getattr(props, "category", None))
 
 
 def _pin_current_template(matches, current_id):
@@ -290,48 +238,6 @@ def _pin_current_template(matches, current_id):
     return [current] + list(matches)
 
 
-#: Categories where a recipe belongs to a GENERATION as well as a subject:
-#: some of its recipes are preserved legacy versions shown beside the
-#: definitive ones. Derived from the catalogue, never listed by hand -- a
-#: category with no legacy recipe would draw a Definitive / Legacy / All
-#: strip whose Legacy view is empty and whose All view changes nothing.
-#:
-#: This is a separate axis from the subcategory, which says what a recipe is
-#: ABOUT; the stage says which generation of it you are looking at.
-STAGED_CATEGORIES = frozenset(
-    item["category"] for item in templates.TEMPLATES if item.get("legacy_stage")
-)
-
-
-def _catalogue_stage_filter(props, matches):
-    if getattr(props, "category", "") not in STAGED_CATEGORIES:
-        return list(matches)
-    view = getattr(props, "catalogue_stage_view", "DEFINITIVE")
-    if view == "ALL":
-        return list(matches)
-    if view == "LEGACY":
-        return [item for item in matches if item.get("legacy_stage")]
-    return [item for item in matches if item.get("definitive_stage")]
-
-
-def _stage_view_showing(template):
-    """The stage view that would list this recipe, or "" for any.
-
-    Selecting a recipe the current view hides would otherwise assign an enum
-    value the filter has just removed, and RNA raises TypeError straight out of
-    espresso.select_template. Moving the view to the one that shows the target
-    keeps the enum honest AND tells the artist where they landed, which pinning
-    the value into a shelf it does not belong to did not.
-    """
-    if template is None or template.get("category") not in STAGED_CATEGORIES:
-        return ""
-    if template.get("definitive_stage"):
-        return "DEFINITIVE"
-    if template.get("legacy_stage"):
-        return "LEGACY"
-    return "ALL"
-
-
 def template_items(self, _context):
     global _TEMPLATE_ITEMS_CACHE, _TEMPLATE_ITEMS_KEY
     key = (
@@ -339,7 +245,6 @@ def template_items(self, _context):
         self.category,
         getattr(self, "browse_group", browse_groups.ALL_GROUP),
         getattr(self, "last_template_id", ""),
-        getattr(self, "catalogue_stage_view", "DEFINITIVE"),
         len(templates.TEMPLATES),
     )
     if key == _TEMPLATE_ITEMS_KEY and _TEMPLATE_ITEMS_CACHE:
@@ -361,13 +266,10 @@ def template_items(self, _context):
         )
         if not matches:
             matches = templates.templates_by_category(self.category)
-    matches = _catalogue_stage_filter(self, matches)
-    matches = _collapse_channel_sets(matches, getattr(self, "last_template_id", ""))
-    # Every item carries its own description, so hovering the template NAME shows
-    # what the LOADED template does, and browsing the open dropdown explains each
-    # entry. The generic "what a template is" explanation deliberately lives in
-    # Help, not here — it is read once, and repeating it on every hover buried
-    # the description the user actually came for.
+    # Every item carries its own description, so hovering the template name shows what
+    # the loaded template does, and browsing the open dropdown explains each entry. The
+    # general explanation of what a template is lives in Help, since it is read once and
+    # repeating it on every hover would bury the description the user came for.
     _TEMPLATE_ITEMS_CACHE = [
         (
             item["id"],
@@ -382,11 +284,11 @@ def template_items(self, _context):
     return _TEMPLATE_ITEMS_CACHE
 
 
-# How many numbered slots exist per type. A template with more visible
+# How many numbered slots exist per type (the widest Lite template has eight parameters). A template with more visible
 # parameters than this has nowhere to store the extras, and the panel would
 # fail to draw them - _assert_slots_cover_catalogue() below turns that into a
 # startup error instead of a silently broken template.
-PARAM_SLOT_COUNT = 20
+PARAM_SLOT_COUNT = 8
 
 
 def _param_float_name(index):
@@ -397,28 +299,13 @@ def _param_int_name(index):
     return f"param_int_{index}"
 
 
-def _param_bool_name(index):
-    return f"param_bool_{index}"
-
-
 def _param_color_name(index):
     return f"param_color_{index}"
 
 
-def _param_string_name(index):
-    return f"param_string_{index}"
-
-
-def _param_enum_name(index):
-    return f"param_enum_{index}"
-
-
 def _slot_kind(param):
     """Which numbered slot family a template parameter is stored in."""
-    return {
-        "INT": "int", "BOOL": "bool", "COLOR": "color", "STRING": "string",
-        "ENUM": "enum",
-    }.get(param.get("type"), "float")
+    return {"INT": "int", "COLOR": "color"}.get(param.get("type"), "float")
 
 
 def advanced_param_property_name(control):
@@ -435,14 +322,8 @@ def param_property_name(param, index):
     kind = _slot_kind(param)
     if kind == "int":
         return _param_int_name(index)
-    if kind == "bool":
-        return _param_bool_name(index)
     if kind == "color":
         return _param_color_name(index)
-    if kind == "string":
-        return _param_string_name(index)
-    if kind == "enum":
-        return _param_enum_name(index)
     return _param_float_name(index)
 
 
@@ -452,9 +333,7 @@ _GENERIC_SLOT_TIP = (
 )
 
 
-_SLOT_NAME = {"float": _param_float_name, "int": _param_int_name,
-              "bool": _param_bool_name, "color": _param_color_name,
-              "string": _param_string_name, "enum": _param_enum_name}
+_SLOT_NAME = {"float": _param_float_name, "int": _param_int_name, "color": _param_color_name}
 
 
 def _redefine_slot_property(name, param, kind):
@@ -463,18 +342,8 @@ def _redefine_slot_property(name, param, kind):
         "description": templates.format_param_input_tooltip(param),
         "update": on_param_update,
     }
-    if kind == "enum":
-        items = tuple(tuple(item) for item in param.get("enum_items", ()))
-        if not items:
-            items = (("NONE", "None", "No options are available"),)
-        identifiers = {item[0] for item in items}
-        default = str(param.get("default", items[0][0]))
-        kwargs["items"] = items
-        kwargs["default"] = default if default in identifiers else items[0][0]
-        setattr(ESPRESSO_Props, name, bpy.props.EnumProperty(**kwargs))
-    elif kind == "string":
-        setattr(ESPRESSO_Props, name, bpy.props.StringProperty(**kwargs))
-    elif kind == "color":
+    if kind == "color":
+        # subtype COLOR    elif kind == "color":
         # subtype COLOR draws Blender's own swatch and colour wheel. Picking a
         # colour by eye is the whole point; three 0-to-1 sliders made the artist
         # do the conversion in their head.
@@ -483,10 +352,6 @@ def _redefine_slot_property(name, param, kind):
             default=tuple(param.get("default", (1.0, 1.0, 1.0))),
             **kwargs,
         ))
-    elif kind == "bool":
-        # A BoolProperty draws as a checkbox; an int or float slot would render
-        # a 0/1 number field, which is what a toggle must never look like.
-        setattr(ESPRESSO_Props, name, bpy.props.BoolProperty(**kwargs))
     elif kind == "int":
         if param.get("min") is not None:
             kwargs["min"] = int(param["min"])
@@ -503,21 +368,11 @@ def _redefine_slot_property(name, param, kind):
 
 def _reset_slot_property(name, kind):
     kwargs = {"description": _GENERIC_SLOT_TIP, "update": on_param_update}
-    if kind == "enum":
-        setattr(ESPRESSO_Props, name, bpy.props.EnumProperty(
-            items=(("NONE", "None", "No options are available"),),
-            default="NONE", **kwargs,
-        ))
-        return
-    if kind == "string":
-        setattr(ESPRESSO_Props, name, bpy.props.StringProperty(**kwargs))
-        return
     if kind == "color":
         setattr(ESPRESSO_Props, name, bpy.props.FloatVectorProperty(
             size=3, subtype="COLOR", min=0.0, max=1.0, default=(1.0, 1.0, 1.0), **kwargs))
         return
-    factory = {"bool": bpy.props.BoolProperty,
-               "int": bpy.props.IntProperty}.get(kind, bpy.props.FloatProperty)
+    factory = bpy.props.IntProperty if kind == "int" else bpy.props.FloatProperty
     setattr(ESPRESSO_Props, name, factory(**kwargs))
 
 
@@ -528,10 +383,7 @@ def _refresh_slot_tooltips(template):
     the slots the new template actually uses with its own name/description/
     min/max right before applying values, and reset the rest to the generic
     fallback so no stale per-template text lingers on an unused slot."""
-    used = {
-        "float": set(), "int": set(), "bool": set(), "color": set(),
-        "string": set(), "enum": set(),
-    }
+    used = {"float": set(), "int": set(), "color": set()}
     for index, param in enumerate(template.get("params", [])):
         if param.get("advanced"):
             continue
@@ -645,50 +497,10 @@ def set_last_apply_status(props, text):
 def get_current_template(props):
     # Every navigation boundary keeps this StringProperty truthful. Reading it
     # avoids rebuilding the dynamic EnumProperty's item list on every draw.
-    template = (
+    return (
         templates.TEMPLATE_BY_ID.get(props.last_template_id)
         or templates.templates_by_category(props.category)[0]
     )
-    return templates.resolve_application_mode(
-        template, getattr(props, "application_mode", "SINGLE"),
-    )
-
-
-_APPLICATION_MODE_ITEMS = {
-    "": (("SINGLE", "Single Property", "Apply the recipe to the chosen property"),),
-}
-
-
-def _application_mode_items(self, context):
-    """The selected recipe's declared modes, cached per recipe so the strings
-    Blender keeps pointers to stay alive."""
-    template_id = str(getattr(self, "template", "") or "")
-    items = _APPLICATION_MODE_ITEMS.get(template_id)
-    if items is None:
-        base = templates.TEMPLATE_BY_ID.get(template_id)
-        modes = templates.application_modes(base) if base else []
-        items = tuple(
-            (str(mode["id"]), str(mode["label"]), str(mode.get("description") or ""))
-            for mode in modes
-        ) or _APPLICATION_MODE_ITEMS[""]
-        _APPLICATION_MODE_ITEMS[template_id] = items
-    return items
-
-
-def on_application_mode_update(self, context):
-    if getattr(self, "suspend_param_updates", False):
-        return
-    base = templates.TEMPLATE_BY_ID.get(self.last_template_id)
-    if base is None:
-        return
-    shared_values = collect_values(self, base)
-    resolved = get_current_template(self)
-    values = {spec["token"]: spec.get("default", 0) for spec in resolved.get("params", ())}
-    values.update({token: value for token, value in shared_values.items() if token in values})
-    _apply_values(self, resolved, values)
-    self.parameter_mode = "SETUP"
-    self.selected_motion_channel = ""
-    refresh_preview(self, context)
 
 
 def get_advanced_param_value(props, control):
@@ -720,14 +532,8 @@ def get_param_value(props, param, index):
         return get_advanced_param_value(props, param)
     if param.get("type") == "INT":
         return getattr(props, _param_int_name(index))
-    if param.get("type") == "BOOL":
-        return 1 if getattr(props, _param_bool_name(index)) else 0
     if param.get("type") == "COLOR":
         return tuple(getattr(props, _param_color_name(index)))
-    if param.get("type") == "STRING":
-        return getattr(props, _param_string_name(index))
-    if param.get("type") == "ENUM":
-        return getattr(props, _param_enum_name(index))
     return getattr(props, _param_float_name(index))
 
 
@@ -738,15 +544,9 @@ def set_param_value(props, param, index, value):
     kind = _slot_kind(param)
     if kind == "int":
         setattr(props, _param_int_name(index), int(round(value)))
-    elif kind == "bool":
-        setattr(props, _param_bool_name(index), bool(round(float(value))))
     elif kind == "color":
         rgb = tuple(value)[:3] if hasattr(value, "__iter__") else (float(value),) * 3
         setattr(props, _param_color_name(index), rgb)
-    elif kind == "string":
-        setattr(props, _param_string_name(index), str(value))
-    elif kind == "enum":
-        setattr(props, _param_enum_name(index), str(value))
     else:
         setattr(props, _param_float_name(index), float(value))
 
@@ -784,59 +584,9 @@ def _carry_manual_params_enabled(context):
     return True if prefs is None else bool(getattr(prefs, "carry_manual_params", True))
 
 
-def _templates_are_paired_variants(previous, current):
-    """Return whether two templates are two parts of ONE setup.
-
-    Two explicit relationships count:
-
-    * both declare the same ``parameter_share_group`` — a signal's coordinated
-      Green/Amber/Red aspects or an ambulance bar's colours;
-    * one explicitly declares the other via ``pair_with`` — the older X/Y
-      component pairs (circle, spiral, figure-8) and the conveyor belt/roller.
-
-    ``role_set`` is intentionally not enough. It controls the channel picker and
-    multi-part application, but it may group alternatives with deliberately
-    different defaults (Bowling, Golf, Tennis, Rubber and Ping-Pong balls).
-    """
-    if not previous or not current:
-        return False
-    previous_share_group = previous.get("parameter_share_group") or ""
-    if previous_share_group and previous_share_group == (
-        current.get("parameter_share_group") or ""
-    ):
-        return True
-    previous_id = previous.get("id", "")
-    current_id = current.get("id", "")
-    return bool(
-        previous.get("pair_with") == current_id
-        or current.get("pair_with") == previous_id
-    )
-
-
-def _templates_are_channel_siblings(previous, current):
-    """Whether two templates are selectable channels of the same family."""
-    if not previous or not current:
-        return False
-    role_set = previous.get("role_set") or ""
-    return bool(role_set and role_set == (current.get("role_set") or ""))
-
-
 def _carry_manual_params_for_switch(context, previous, current):
-    """Apply the nested global, channel-family, and paired carry policy."""
-    if not _carry_manual_params_enabled(context):
-        return False
-    prefs = utils.addon_preferences(context)
-    channels_only = bool(
-        getattr(prefs, "carry_manual_params_channels_only", False)
-    ) if prefs else False
-    if not channels_only:
-        return True
-    if not _templates_are_channel_siblings(previous, current):
-        return False
-    paired_only = bool(
-        getattr(prefs, "carry_manual_params_paired_only", False)
-    ) if prefs else False
-    return not paired_only or _templates_are_paired_variants(previous, current)
+    """Whether a switch carries the last hand-edited values across."""
+    return _carry_manual_params_enabled(context)
 
 
 def _advanced_controls_enabled(context):
@@ -854,10 +604,11 @@ def _apply_values(props, template, values):
 
 
 def apply_combined_preset(props, template, preset_values):
-    """Set several parameters together from one button click — unlike the
-    per-parameter preset dropdowns, which only ever touch one token at a
-    time. Only the tokens named in ``preset_values`` change; anything else
-    the user has set (e.g. Period, Min, Max) is left alone."""
+    """Set several parameters together from one button click, unlike the per-parameter
+    preset dropdowns, which touch one token at a time. Only the tokens named in
+    ``preset_values`` change; anything else the user has set (Period, Min, Max) is
+    left alone.
+    """
     token_to_param = {
         param["token"]: (index, param)
         for index, param in enumerate(template.get("params", []))
@@ -951,9 +702,8 @@ def selected_live_effect(context, *, for_draw=False):
 def live_parameter_template(context, fallback=None, *, for_draw=False):
     """Parameter schema owned by the selected Live effect.
 
-    Prepared structures use synthetic schemas that deliberately do not live in
-    the catalogue.  Selecting one edits that structure without navigating the
-    main template browser away from the artist's current motion recipe.
+    Selecting an applied effect edits its settings without navigating the main
+    template browser away from the artist's current motion recipe.
     """
     props = getattr(getattr(context, "scene", None), "espresso_props", None)
     fallback = fallback or (get_current_template(props) if props else None)
@@ -1054,7 +804,7 @@ def _stored_effect_values(effect):
     return dict(values) if isinstance(values, dict) else {}
 
 
-def _authoring_values_differ(left, right, template):
+def _values_differ(left, right, template):
     if not left or not right or not template:
         return False
     for param in template.get("params") or ():
@@ -1071,15 +821,12 @@ def _authoring_values_differ(left, right, template):
         elif kind == "INT":
             if int(round(current)) != int(round(stored)):
                 return True
-        elif kind in {"STRING", "ENUM", "BOOL"}:
-            if str(current) != str(stored):
-                return True
         elif abs(float(current) - float(stored)) > 1e-6:
             return True
     return False
 
 
-def authoring_presentation(props, context=None):
+def mode_presentation(props, context=None):
     """Read-only Setup vs Live identity. Does not mutate catalogue state.
 
     The saved RNA identifier stays ``LIVE``. Artist-facing copy uses Live.
@@ -1139,7 +886,7 @@ def authoring_presentation(props, context=None):
         compare_template = effect.get("template") or parameter_template
         if stored and compare_template:
             identity["can_compare"] = True
-            identity["modified"] = _authoring_values_differ(
+            identity["modified"] = _values_differ(
                 collect_values(props, compare_template), stored, compare_template,
             )
         return identity
@@ -1155,7 +902,7 @@ def authoring_presentation(props, context=None):
             stored = parameter_bindings.read_values(binding)
             if stored and parameter_template:
                 identity["can_compare"] = True
-                identity["modified"] = _authoring_values_differ(
+                identity["modified"] = _values_differ(
                     collect_values(props, parameter_template), stored, parameter_template,
                 )
         return identity
@@ -1172,7 +919,7 @@ def commit_slot_presentation(props, context=None):
     from ...apply import target_memory
     from ...catalogue import templates as catalogue_templates
 
-    identity = authoring_presentation(props, context)
+    identity = mode_presentation(props, context)
     template = get_current_template(props)
     is_motion = catalogue_templates.has_motion_plan(template)
     drives_transforms = False
@@ -1193,11 +940,7 @@ def commit_slot_presentation(props, context=None):
         "operator_id": (
             "espresso.update_last_target"
             if identity["is_applied"]
-            else (
-                "espresso.apply_motion_selected"
-                if is_motion and drives_transforms
-                else "espresso.apply_expression"
-            )
+            else "espresso.apply_expression"
         ),
         "enabled": False,
         "reason": "",
@@ -1251,21 +994,6 @@ def commit_slot_presentation(props, context=None):
     if latest:
         slot["conflict"] = "Existing Espresso effect - will replace"
     return slot
-
-
-def read_pinned_live_entry(props):
-    try:
-        raw = getattr(props, "pinned_live_entry_json", "") or ""
-        data = json.loads(raw) if raw else {}
-    except (TypeError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def set_pinned_live_entry(props, template_id, entry, label=""):
-    props.pinned_live_template_id = str(template_id or "")
-    props.pinned_live_label = str(label or "")
-    props.pinned_live_entry_json = json.dumps(entry or {}, separators=(",", ":"), sort_keys=True)
 
 
 def clear_pinned_live_entry(props):
@@ -1346,8 +1074,6 @@ def _is_changed_from_default(param, value):
         return any(abs(float(a) - float(b)) > 1e-6 for a, b in zip(tuple(value), tuple(default)))
     if param.get("type") == "INT":
         return int(round(value)) != int(round(default))
-    if param.get("type") in {"STRING", "ENUM"}:
-        return str(value) != str(default)
     return abs(float(value) - float(default)) > 1e-6
 
 
@@ -1389,7 +1115,6 @@ def refresh_preview(props, context):
         props.preview = expression
         props.is_valid = bool(valid)
         props.validation_message = message
-        props.result_summary = ""
         props.preview_output_baseline = 0.0
         return
 
@@ -1425,7 +1150,6 @@ def refresh_preview(props, context):
     props.preview_output_baseline = float(selected.get("output_baseline", 0.0))
     props.is_valid = all_valid
     props.validation_message = "; ".join(dict.fromkeys(validation_messages))
-    props.result_summary = utils.format_result_summary(template, preview_values, context.scene)
 
 
 def built_channel_previews(props):
@@ -1472,16 +1196,6 @@ def enabled_channel_ids_for_template(props, template):
     "no filtering", which is the zero-overhead common case."""
     template_id = template.get("id", "")
     disabled = set(_disabled_channel_map(props).get(template_id) or [])
-    values = collect_values(props, template)
-    conditional_disabled = {
-        channel["id"]
-        for channel in templates.template_channels(template)
-        if channel.get("enabled_if") and any(
-            bool(values.get(token)) != bool(required)
-            for token, required in channel["enabled_if"].items()
-        )
-    }
-    disabled.update(conditional_disabled)
     if not disabled:
         return None
     all_ids = {channel["id"] for channel in templates.template_channels(template)}
@@ -1490,18 +1204,18 @@ def enabled_channel_ids_for_template(props, template):
 
 def apply_template_defaults(props, template):
     _apply_values(props, template, _defaults_for_template(template))
-# The `template` EnumProperty's item list is recomputed from BOTH `search_text`
-# and `category` (see template_items). Assigning an id that is not in the list as
-# it stands *at that instant* raises TypeError. Two rules keep this safe:
+# The ``template`` EnumProperty's item list is recomputed from both ``search_text`` and
+# ``category`` (see template_items), and assigning an id that is not in the list as it
+# stands at that instant raises TypeError. Two rules keep this safe:
 #
-#   1. Narrow the item list before assigning into it — clear an active search so
-#      the list is scoped to the category we are about to select from.
-#   2. Never read `self.template` to decide what to assign. When the stored enum
-#      value has fallen out of the current item list Blender resolves the read to
-#      the first item instead, which silently hides the desync. Read
-#      `self.last_template_id` (a plain StringProperty, always truthful) instead.
+# 1. Narrow the item list before assigning into it: clear an active search so the list
+#    is scoped to the category about to be selected from.
+# 2. Never read ``self.template`` to decide what to assign. When the stored enum value
+#    has fallen out of the current item list, Blender resolves the read to the first
+#    item, which hides the mismatch. Read ``self.last_template_id`` (a plain
+#    StringProperty) instead.
 #
-# Clearing `search_text` fires on_search_update, which would otherwise chase the
+# Clearing ``search_text`` fires on_search_update, which would otherwise chase the
 # category back and recurse, so both callbacks share a re-entrancy guard.
 
 
@@ -1519,37 +1233,20 @@ def apply_template_selection(props, template_id):
     if template is None:
         return False
 
-    # Point last_template_id at the TARGET before the enum is assigned. The
-    # template list collapses each channel set to one member and keeps the one
-    # last_template_id names; without this, switching to a sibling (one channel sibling ->
-    # its partner) would assign a value the collapsed list does not contain, and
-    # Blender rejects an enum value not in its items. This is a plain
-    # StringProperty with no update hook, and the items cache key includes it,
-    # so setting it here forces the list to recompute with the target present.
-    # Remember what we are LEAVING before that is overwritten. on_template_update
-    # needs the outgoing template to carry shared values across, and the line
-    # below deliberately destroys it to keep the collapsed enum valid.
+    # Point last_template_id at the target before the enum is assigned. The template
+    # list collapses each channel set to one member and keeps the one last_template_id
+    # names; without this, switching to a sibling would assign a value the collapsed
+    # list does not contain, and Blender rejects an enum value not in its items. This is
+    # a plain StringProperty with no update hook, and the items cache key includes it,
+    # so setting it here makes the list recompute with the target present. The outgoing
+    # template is remembered first, because on_template_update needs it to carry shared
+    # values across and the line below overwrites it to keep the collapsed enum valid.
     if props.last_template_id != template_id:
         props.switch_from_template_id = props.last_template_id
     props.last_template_id = template_id
 
     category = template["category"]
     browse_group = browse_groups.group_for_template(category, template_id)
-    required_view = _stage_view_showing(template)
-    if (
-        required_view
-        and getattr(props, "catalogue_stage_view", "DEFINITIVE")
-        not in (required_view, "ALL")
-    ):
-        # Suspended: the view's own update handler re-picks a template from the
-        # CURRENT browse group, which is still the outgoing recipe's group at
-        # this point -- it would assign an id the enum does not hold yet. The
-        # lines below set the group and the template explicitly, in that order.
-        props.suspend_nav_updates = True
-        try:
-            props.catalogue_stage_view = required_view
-        finally:
-            props.suspend_nav_updates = False
     if props.category != category:
         # on_category_update clears the search and resolves the pending id, in
         # that order, so the enum is guaranteed to contain the target.
@@ -1585,18 +1282,16 @@ def on_category_update(self, context):
             if pending and pending.get("category") == self.category
             else browse_groups.ALL_GROUP
         )
-        matches = _catalogue_stage_filter(self, browse_groups.templates_for_group(
+        matches = browse_groups.templates_for_group(
             templates.TEMPLATES,
             self.category,
             self.browse_group,
-        ))
+        )
         if not matches:
             return
 
         available = {item["id"] for item in matches}
-        # The fallback comes from the pool the enum LISTS: channel sets are
-        # collapsed there, so matches[0] can be a member it does not hold.
-        fallback = _collapse_channel_sets(matches, self.last_template_id)[0]["id"]
+        fallback = matches[0]["id"]
         target_id = self.pending_template_id if self.pending_template_id in available else fallback
         self.pending_template_id = ""
 
@@ -1619,16 +1314,16 @@ def on_browse_group_update(self, context):
     try:
         if self.search_text:
             self.search_text = ""
-        matches = _catalogue_stage_filter(self, browse_groups.templates_for_group(
+        matches = browse_groups.templates_for_group(
             templates.TEMPLATES,
             self.category,
             self.browse_group,
-        ))
+        )
         if not matches:
             return
         available = {item["id"] for item in matches}
         current_id = self.last_template_id
-        fallback = _collapse_channel_sets(matches, current_id)[0]["id"]
+        fallback = matches[0]["id"]
         target_id = current_id if current_id in available else fallback
         previous = self.last_template_id
         self.template = target_id
@@ -1637,28 +1332,6 @@ def on_browse_group_update(self, context):
 
     if previous == target_id:
         refresh_preview(self, context)
-
-
-def on_catalogue_stage_view_update(self, context):
-    if self.suspend_nav_updates or self.category not in STAGED_CATEGORIES:
-        return
-    matches = _catalogue_stage_filter(
-        self,
-        browse_groups.templates_for_group(
-            templates.TEMPLATES, self.category, self.browse_group,
-        ) or templates.templates_by_category(self.category),
-    )
-    if not matches:
-        return
-    current_id = self.last_template_id
-    fallback = _collapse_channel_sets(matches, current_id)[0]["id"]
-    target_id = current_id if any(item["id"] == current_id for item in matches) else fallback
-    self.suspend_nav_updates = True
-    try:
-        self.template = target_id
-    finally:
-        self.suspend_nav_updates = False
-    refresh_preview(self, context)
 
 
 def on_search_update(self, context):
@@ -1721,11 +1394,11 @@ def on_driver_target_active_index_update(self, context):
 
 
 def on_template_update(self, context):
-    # apply_template_selection points last_template_id at the TARGET before
-    # assigning the enum (the collapsed channel list must contain the value
-    # being set), so it cannot answer "what were we on?". It stashes the
-    # outgoing id here instead; fall back to last_template_id for a direct
-    # enum edit, where nothing has been overwritten.
+    # apply_template_selection points last_template_id at the target before assigning
+    # the enum (the collapsed channel list must contain the value being set), so it
+    # cannot answer "what were we on?". It stashes the outgoing id here instead; a
+    # direct enum edit falls back to last_template_id, where nothing has been
+    # overwritten.
     previous_id = self.switch_from_template_id or self.last_template_id
     self.switch_from_template_id = ""
     selected_id = self.template
@@ -1733,8 +1406,6 @@ def on_template_update(self, context):
         self.last_template_id = selected_id
     template = get_current_template(self)
     previous = templates.TEMPLATE_BY_ID.get(previous_id) if previous_id else None
-    if previous and previous.get("id") != template.get("id"):
-        self.camera_previous_target_template_id = previous.get("id", "")
 
     previous_mode = getattr(self, "parameter_mode", "SETUP")
     previous_values = {}
@@ -1749,12 +1420,6 @@ def on_template_update(self, context):
 
     self.suspend_param_updates = True
     try:
-        base_selected = templates.TEMPLATE_BY_ID.get(selected_id)
-        declared_modes = templates.application_modes(base_selected) if base_selected else []
-        valid_modes = {mode["id"] for mode in declared_modes} or {"SINGLE"}
-        if self.application_mode not in valid_modes:
-            # The recipe's first declared mode is its default delivery.
-            self.application_mode = declared_modes[0]["id"] if declared_modes else "SINGLE"
         if getattr(self, "pinned_live_template_id", "") and selected_id != getattr(self, "pinned_live_template_id", ""):
             clear_pinned_live_entry(self)
         self.parameter_mode = "SETUP"
@@ -1778,11 +1443,6 @@ def on_template_update(self, context):
         target_values.update(_shared_tokens(template, carry_values))
 
     _refresh_slot_tooltips(template)
-    # No camera setup records to ensure: Driver Espresso Lite ships no camera
-    # recipe. The import is guarded. Blender swallows exceptions raised inside
-    # a property update callback, so an unguarded import that failed here would
-    # surface only as a printed traceback while the add-on quietly stopped
-    # working.
     _apply_values(self, template, target_values)
     self.last_template_id = template["id"]
     # Selecting a template drops out of any hand-edit session and logs a recent.
@@ -1807,14 +1467,6 @@ def on_param_update(self, context):
     refresh_preview(self, context)
 
 
-def _curve_guide_poll(_self, obj):
-    return bool(obj is not None and obj.type == "CURVE")
-
-
-def _shape_object_poll(_self, obj):
-    return bool(obj is not None and obj.type == "MESH")
-
-
 def _on_visualizer_zoom_axis_update(self, context, changed_axis):
     """Keep at least one graph zoom axis active, including scripted changes."""
     if getattr(self, "suspend_param_updates", False):
@@ -1834,71 +1486,6 @@ def on_visualizer_zoom_x_update(self, context):
 
 def on_visualizer_zoom_y_update(self, context):
     _on_visualizer_zoom_axis_update(self, context, "visualizer_zoom_y")
-
-
-def on_ramp_transition_mode_update(self, context):
-    if getattr(self, "suspend_param_updates", False):
-        return
-    refresh_preview(self, context)
-
-
-def _position_wave_objects(context):
-    return [
-        obj for obj in (getattr(context, "selected_objects", None) or ())
-        if obj.type != "EMPTY" or "Radial Centre" not in obj.name
-    ]
-
-
-def _position_wave_spread_param(template):
-    for index, param in enumerate(template.get("params", ())):
-        if param.get("token") == "SPREAD":
-            return index, param
-    return None, None
-
-
-def refresh_position_wave_auto_fit(props, context, objects=None):
-    """Refresh the fitted frequency immediately before preview or application."""
-    if not getattr(props, "position_wave_auto_fit", False):
-        return False
-    template = get_current_template(props)
-    objects = list(objects) if objects is not None else _position_wave_objects(context)
-    if len(objects) < 2:
-        return False
-    axis = props.light_apply_axis
-    if axis == "AUTO":
-        axis = light_layout.widest_axis(light_layout.positions(objects))[0]
-    spread = light_layout.fit_spread(objects, axis)
-    index, param = _position_wave_spread_param(template)
-    if spread <= 0.0 or param is None:
-        return False
-    set_param_value(props, param, index, spread)
-    return True
-
-
-def set_position_wave_auto_fit(props, context, enabled):
-    """Public toggle helper used by the panel and the one-shot legacy action."""
-    props.position_wave_auto_fit = bool(enabled)
-    if enabled:
-        return refresh_position_wave_auto_fit(props, context)
-    return True
-
-
-def on_position_wave_auto_fit_update(self, context):
-    template = get_current_template(self)
-    index, param = _position_wave_spread_param(template)
-    if param is None:
-        return
-    if self.position_wave_auto_fit:
-        self.position_wave_manual_spread = get_param_value(self, param, index)
-        refresh_position_wave_auto_fit(self, context)
-    else:
-        set_param_value(self, param, index, self.position_wave_manual_spread)
-        refresh_preview(self, context)
-
-
-def on_light_apply_axis_update(self, context):
-    if refresh_position_wave_auto_fit(self, context):
-        refresh_preview(self, context)
 
 
 def on_manual_expression_update(self, context):
@@ -1921,7 +1508,7 @@ def on_manual_mode_update(self, context):
 
 
 # --------------------------------------------------------------------------- #
-# Favorites & recents (JSON-backed lists of template ids)
+# Recent templates (a JSON-backed list of template ids)
 # --------------------------------------------------------------------------- #
 def _read_id_list(raw):
     import json
@@ -1937,23 +1524,6 @@ def _write_id_list(values):
     import json
 
     return json.dumps(values)
-
-
-def get_favorites(props):
-    return _read_id_list(getattr(props, "favorites_mem", "[]"))
-
-
-def is_favorite(props, template_id):
-    return template_id in get_favorites(props)
-
-
-def toggle_favorite(props, template_id):
-    favorites = get_favorites(props)
-    if template_id in favorites:
-        favorites.remove(template_id)
-    else:
-        favorites.insert(0, template_id)
-    props.favorites_mem = _write_id_list(favorites[:12])
 
 
 def get_recents(props):
@@ -2110,43 +1680,10 @@ class ESPRESSO_DriverEditParamItem(bpy.types.PropertyGroup):
     int_value: bpy.props.IntProperty(
         default=0, update=on_pinned_effect_parameter_update,
     )
-    bool_value: bpy.props.BoolProperty(
-        default=False, update=on_pinned_effect_parameter_update,
-    )
-    string_value: bpy.props.StringProperty(
-        default="", update=on_pinned_effect_parameter_update,
-    )
     color_value: bpy.props.FloatVectorProperty(
         size=4, subtype="COLOR", min=0.0, max=1.0,
         default=(1.0, 1.0, 1.0, 1.0),
         update=on_pinned_effect_parameter_update,
-    )
-
-
-def _camera_target_changed(record, context):
-    """Update applied camera recipes when their staged target changes.
-
-    Keep this callback at module scope and define it before the PropertyGroup.
-    RNA callback lambdas lack module globals in their compiled string scope.
-    """
-    # Unreachable in Driver Espresso Lite: no camera recipe ships, so no camera
-    # target property exists for a change to fire from. Kept as a no-op because
-    # the enclosing function is named by an RNA update callback.
-    return
-
-
-class ESPRESSO_CameraTemplateTargetItem(bpy.types.PropertyGroup):
-    """Persistent Object pointer for one setup or applied Camera target role."""
-
-    effect_id: bpy.props.StringProperty(name="Applied Effect ID", default="")
-    template_id: bpy.props.StringProperty(name="Template ID", default="")
-    slot_id: bpy.props.StringProperty(name="Target Slot ID", default="")
-    role: bpy.props.StringProperty(name="Semantic Role", default="")
-    target: bpy.props.PointerProperty(
-        name="Target",
-        description="Blender object bound to this Camera recipe role",
-        type=bpy.types.Object,
-        update=_camera_target_changed,
     )
 
 
@@ -2162,21 +1699,6 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
         update=on_template_kind_update,
     )
     category: bpy.props.EnumProperty(name="Category", description="Filter templates by animation/use-case family", items=category_items, update=on_category_update)
-    catalogue_stage_view: bpy.props.EnumProperty(
-        name="Catalogue",
-        description=(
-            "Show the definitive recipes, the preserved legacy ones they "
-            "replaced, or both. Separate from Subcategory, which says what a "
-            "recipe is about rather than which generation it belongs to"
-        ),
-        items=(
-            ("DEFINITIVE", "Definitive", "The current recipes"),
-            ("LEGACY", "Legacy", "Preserved compatibility recipes for existing files"),
-            ("ALL", "All", "Show definitive and legacy recipes together"),
-        ),
-        default="DEFINITIVE",
-        update=on_catalogue_stage_view_update,
-    )
     browse_group: bpy.props.EnumProperty(
         name="Subcategory",
         description="Show a broad shelf inside crowded categories without changing global search",
@@ -2185,10 +1707,10 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     )
     template: bpy.props.EnumProperty(
         name="Template",
-        # Deliberately empty. Blender prepends this to the selected item's tooltip,
-        # so anything here is repeated on EVERY hover and pushes the thing the user
-        # actually wants - what the loaded template does - down the tooltip. The
-        # "what a template is" explanation lives in Preferences > Help, read once.
+        # Deliberately empty. Blender prepends this to the selected item's tooltip, so
+        # anything here would be repeated on every hover and push the loaded template's
+        # description down the tooltip. The general explanation lives in Preferences >
+        # Help.
         description="",
         items=template_items,
         update=on_template_update,
@@ -2203,24 +1725,6 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
         ),
         default="SETUP",
         update=on_parameter_mode_update,
-    )
-    camera_setup_targets: bpy.props.CollectionProperty(
-        type=ESPRESSO_CameraTemplateTargetItem,
-    )
-    camera_previous_target_template_id: bpy.props.StringProperty(
-        name="Previous Camera Target Template",
-        default="",
-        options={"HIDDEN"},
-    )
-    application_mode: bpy.props.EnumProperty(
-        name="Application",
-        description="Which delivery this recipe uses: the choices are the recipe's own",
-        # The items are the selected recipe's declared modes. The labels come
-        # from the recipe rather than from a fixed pair, so a camera move
-        # offering Smooth / Minimum jerk is not drawn as "Single Property /
-        # Weapon Motion Set".
-        items=_application_mode_items,
-        update=on_application_mode_update,
     )
     live_parameter_status: bpy.props.StringProperty(
         name="Live Parameter Status", default="", options={"HIDDEN"},
@@ -2257,62 +1761,11 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     suspend_pinned_effect_updates: bpy.props.BoolProperty(
         default=False, options={"HIDDEN", "SKIP_SAVE"},
     )
-    ramp_transition_mode: bpy.props.EnumProperty(
-        name="Transition Mode",
-        description=(
-            "How the animated Factor travels between palette values; the "
-            "ColorRamp interpolation remains an independent colour control"
-        ),
-        items=colour_ramp.TRANSITION_ITEMS,
-        default="STEPPED",
-        update=on_ramp_transition_mode_update,
-    )
-
     param_color_0: bpy.props.FloatVectorProperty(size=3, subtype="COLOR", min=0.0, max=1.0, default=(1.0, 1.0, 1.0), description=_GENERIC_SLOT_TIP, update=on_param_update)
     param_color_1: bpy.props.FloatVectorProperty(size=3, subtype="COLOR", min=0.0, max=1.0, default=(1.0, 1.0, 1.0), description=_GENERIC_SLOT_TIP, update=on_param_update)
     param_color_2: bpy.props.FloatVectorProperty(size=3, subtype="COLOR", min=0.0, max=1.0, default=(1.0, 1.0, 1.0), description=_GENERIC_SLOT_TIP, update=on_param_update)
     param_color_3: bpy.props.FloatVectorProperty(size=3, subtype="COLOR", min=0.0, max=1.0, default=(1.0, 1.0, 1.0), description=_GENERIC_SLOT_TIP, update=on_param_update)
 
-    param_string_0: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_1: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_2: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_3: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_4: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_5: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_6: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_7: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_8: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_9: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_10: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_11: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_12: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_13: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_14: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_15: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_16: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_17: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_18: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_string_19: bpy.props.StringProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_0: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_1: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_2: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_3: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_4: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_5: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_6: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_7: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_8: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_9: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_10: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_11: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_12: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_13: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_14: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_15: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_16: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_17: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_18: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_enum_19: bpy.props.EnumProperty(items=(("NONE", "None", "No options are available"),), default="NONE", description=_GENERIC_SLOT_TIP, update=on_param_update)
     param_float_0: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
     param_float_1: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
     param_float_2: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
@@ -2321,39 +1774,7 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     param_float_5: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
     param_float_6: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
     param_float_7: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_8: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_9: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_10: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_11: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_12: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_13: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_14: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_15: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_16: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_17: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_18: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_float_19: bpy.props.FloatProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
 
-    param_bool_0: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_1: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_2: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_3: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_4: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_5: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_6: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_7: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_8: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_9: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_10: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_11: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_12: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_13: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_14: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_15: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_16: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_17: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_18: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
-    param_bool_19: bpy.props.BoolProperty(description=_GENERIC_SLOT_TIP, update=on_param_update)
 
     param_int_0: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
     param_int_1: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
@@ -2363,18 +1784,6 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     param_int_5: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
     param_int_6: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
     param_int_7: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_8: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_9: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_10: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_11: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_12: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_13: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_14: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_15: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_16: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_17: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_18: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
-    param_int_19: bpy.props.IntProperty(description="Driver Espresso template parameter. Hover the parameter label for template-specific meaning, default, and range.", update=on_param_update)
 
     preview: bpy.props.StringProperty(name="Expression", default="")
     preview_output_baseline: bpy.props.FloatProperty(default=0.0, options={"HIDDEN"})
@@ -2403,7 +1812,6 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     )
     is_valid: bpy.props.BoolProperty(name="Valid", default=False)
     validation_message: bpy.props.StringProperty(name="Validation", default="")
-    result_summary: bpy.props.StringProperty(name="Result Summary", default="")
     compact_level: bpy.props.IntProperty(
         name="Compact Level",
         description=(
@@ -2437,11 +1845,6 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     )
     template_variants_open: bpy.props.BoolProperty(name="Template Variants Open", description="Expand or collapse the template variants section", default=True)
     parameters_open: bpy.props.BoolProperty(name="Parameters Open", description="Expand or collapse the template parameters section", default=True)
-    # Which of an authoring rig panel's collapsible sections are open, as a
-    # comma-separated list of section keys. Per scene, like parameters_open:
-    # a layout preference, not a flight setting, so it lives here and not on
-    # the camera's flight settings where the reset and coverage tests would
-    # count it as a dial.
     param_group_timing_open: bpy.props.BoolProperty(
         name="Timing Open",
         description="Expand or collapse timing controls",
@@ -2457,23 +1860,8 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
         description="Expand or collapse additional controls",
         default=False,
     )
-    favorites_more_open: bpy.props.BoolProperty(
-        name="More Favorites",
-        description="Show Favorites beyond the first eight shortcuts",
-        default=False,
-    )
-    recents_more_open: bpy.props.BoolProperty(
-        name="More Recent",
-        description="Show Recent templates beyond the first eight shortcuts",
-        default=False,
-    )
     advanced_timing_open: bpy.props.BoolProperty(name="Advanced Timing Open", description="Expand or collapse the advanced timing controls section", default=True)
     advanced_output_open: bpy.props.BoolProperty(name="Advanced Output Open", description="Expand or collapse the advanced output controls section", default=True)
-    driver_target_open: bpy.props.BoolProperty(
-        name="Applied Effects Open",
-        description="Expand or collapse the applied effects list",
-        default=False,
-    )
     applied_effects_cached_count: bpy.props.IntProperty(
         name="Applied Effects Cached Count",
         description="Last known Applied Effects count for the collapsed panel header",
@@ -2498,12 +1886,12 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     )
     sidebar_tab: bpy.props.EnumProperty(
         name="Workspace",
-        description="Switch between Motion authoring, effect organization, and input controllers inside the Espresso panel",
+        description="Switch between choosing a motion, organizing applied effects, and input controllers inside the Espresso panel",
         items=(
             (
                 "MOTION",
                 "Motion",
-                "Recipe authoring and parameters; Preview remains in its own panel",
+                "Choose a motion and set its parameters; Preview remains in its own panel",
                 "ANIM_DATA",
                 0,
             ),
@@ -2534,15 +1922,12 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
         description="Expand or collapse the apply and manage buttons",
         default=True,
     )
-    # The last bake range the artist actually confirmed. Every bake popup seeded
-    # itself from the scene range, so a deliberate choice - bake 40-90 to check
-    # one beat - was thrown away the moment the dialog closed, and re-typed on
-    # the next bake. Remembered per scene, because the useful range is a property
-    # of the shot rather than of the session.
-    #
-    # bake_range_remembered gates it: without the flag, a start of 0 is
-    # indistinguishable from "never set", and the first bake in a fresh scene
-    # should still offer the scene range.
+    # The last bake range the artist confirmed. Remembered per scene, because the useful
+    # range is a property of the shot rather than of the session, so a deliberate choice
+    # (bake 40-90 to check one beat) is not thrown away when the dialog closes.
+    # ``bake_range_remembered`` gates it: without the flag a start of 0 is
+    # indistinguishable from "never set", and the first bake in a fresh scene should
+    # offer the scene range.
     bake_range_remembered: bpy.props.BoolProperty(default=False)
     bake_last_start: bpy.props.IntProperty(default=1)
     bake_last_end: bpy.props.IntProperty(default=250)
@@ -2583,12 +1968,6 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
              "- the shape as authored"),
         ],
         default="LIVE",
-    )
-    preview_mode: bpy.props.EnumProperty(
-        name="Preview",
-        description="Draw the sampled curve as a graph",
-        items=_preview_mode_items(),
-        default="GRAPH",
     )
     clamp_min: bpy.props.FloatProperty(
         name="Min",
@@ -2661,9 +2040,7 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     )
     manual_mode: bpy.props.BoolProperty(name="Edit Expression", description="Hand-edit the generated expression instead of building it from parameters", default=False, update=on_manual_mode_update)
     manual_expression: bpy.props.StringProperty(name="Expression (editable)", description="Editable driver expression used while Edit Expression is on", default="", update=on_manual_expression_update)
-    favorites_mem: bpy.props.StringProperty(name="Favorites", default="[]")
     recents_mem: bpy.props.StringProperty(name="Recents", default="[]")
-    favorites_open: bpy.props.BoolProperty(name="Show Favorites", description="Expand or collapse the favorites and recents shortcuts", default=False)
     lightweight_preview: bpy.props.BoolProperty(
         name="Lightweight Preview",
         description="Draw the waveform as a text curve instead of a rendered image. Cheapest on slower PCs.",
@@ -2673,7 +2050,6 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     copied_driver_template: bpy.props.StringProperty(name="Copied Driver Template", default="")
     copied_driver_label: bpy.props.StringProperty(name="Copied Driver Label", default="")
     copied_driver_rest_mode: bpy.props.StringProperty(name="Copied Driver Rest Mode", default="OFF")
-    copied_driver_source: bpy.props.StringProperty(name="Copied Driver Source", default="{}")
     copied_driver_output_baseline: bpy.props.FloatProperty(default=0.0, options={"HIDDEN"})
     copied_driver_parameters: bpy.props.StringProperty(default="{}", options={"HIDDEN"})
     copied_driver_scope: bpy.props.StringProperty(default="SINGLE", options={"HIDDEN"})
@@ -2686,7 +2062,6 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
         description="Named Espresso Controller used for this driver or motion scope",
         items=_live_controller_items,
     )
-    live_control_open: bpy.props.BoolProperty(name="Input Control Open", default=True)
     live_reset_mode: bpy.props.EnumProperty(
         name="Reset Mode",
         description="Value used when the controller disables or reduces the driver",
@@ -2736,31 +2111,13 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
         options={"SKIP_SAVE"},
     )
 
-    # Which property "apply to my selection" writes to. Stores the ROUTE to it
-    # - owner kind, data path, index - never a pointer to one object's
-    # property, because the same route resolved against each selected object is
-    # what gives every object its own driver.
+    # Which property "apply to my selection" writes to. Stores the route to it (owner
+    # kind, data path, index), never a pointer to one object's property, because the
+    # same route resolved against each selected object is what gives every object its
+    # own driver.
     espresso_apply_target: bpy.props.StringProperty(
         name="Espresso Apply Target", default="")
 
-    # Which world axis a travelling light wave moves along. Auto reads it off
-    # the rig, because Position Wave ships wired to X and a rig running along Y
-    # would otherwise sit perfectly still with no clue as to why.
-    light_apply_axis: bpy.props.EnumProperty(
-        name="Wave Axis",
-        description=(
-            "Which world axis a travelling light wave moves along. Auto uses "
-            "the axis the selected lights are most spread out along"
-        ),
-        items=[
-            ("AUTO", "Auto", "Use the axis the lights are most spread along"),
-            ("X", "X", "World X"),
-            ("Y", "Y", "World Y"),
-            ("Z", "Z", "World Z"),
-        ],
-        default="AUTO",
-        update=on_light_apply_axis_update,
-    )
     variant_mem: bpy.props.StringProperty(name="Variant Memory", default="{}")
     template_mem: bpy.props.StringProperty(name="Template Memory", default="{}")
     switch_from_template_id: bpy.props.StringProperty(
@@ -2843,71 +2200,19 @@ class ESPRESSO_Props(bpy.types.PropertyGroup):
     advanced_prop_adv_loop_fit: _advanced_control_property("ADV_LOOP_FIT")
     advanced_prop_adv_mult: _advanced_control_property("ADV_MULT")
     advanced_prop_adv_offset: _advanced_control_property("ADV_OFFSET")
-    advanced_prop_adv_override_fps: _advanced_control_property("ADV_OVERRIDE_FPS")
-    advanced_prop_adv_timing_fps: _advanced_control_property("ADV_TIMING_FPS")
-    advanced_prop_adv_loc_influence: _advanced_control_property("ADV_LOC_INFLUENCE")
-    advanced_prop_adv_rot_influence: _advanced_control_property("ADV_ROT_INFLUENCE")
-    advanced_prop_adv_x_influence: _advanced_control_property("ADV_X_INFLUENCE")
-    advanced_prop_adv_y_influence: _advanced_control_property("ADV_Y_INFLUENCE")
-    advanced_prop_adv_z_influence: _advanced_control_property("ADV_Z_INFLUENCE")
     token_prop_speed: _token_proxy_property("SPEED")
     token_prop_n: _token_proxy_property("N")
-    token_prop_amplitude: _token_proxy_property("AMPLITUDE")
-    token_prop_center: _token_proxy_property("CENTER")
-    token_prop_start: _token_proxy_property("START")
-    token_prop_end: _token_proxy_property("END")
     token_prop_min: _token_proxy_property("MIN")
     token_prop_max: _token_proxy_property("MAX")
     token_prop_phase: _token_proxy_property("PHASE")
-    token_prop_loop_start: _token_proxy_property("LOOP_START")
-    token_prop_loop_end: _token_proxy_property("LOOP_END")
     token_prop_a: _token_proxy_property("A")
     token_prop_b: _token_proxy_property("B")
-    token_prop_in_min: _token_proxy_property("IN_MIN")
-    token_prop_in_max: _token_proxy_property("IN_MAX")
-    token_prop_out_min: _token_proxy_property("OUT_MIN")
-    token_prop_out_max: _token_proxy_property("OUT_MAX")
-    token_prop_power: _token_proxy_property("POWER")
-    token_prop_dead_zone: _token_proxy_property("DEAD_ZONE")
-    token_prop_scale: _token_proxy_property("SCALE")
-    token_prop_threshold: _token_proxy_property("THRESHOLD")
-    token_prop_low: _token_proxy_property("LOW")
-    token_prop_high: _token_proxy_property("HIGH")
     token_prop_range: _token_proxy_property("RANGE")
-    token_prop_strength: _token_proxy_property("STRENGTH")
-    token_prop_radius: _token_proxy_property("RADIUS")
-    token_prop_degrees: _token_proxy_property("DEGREES")
-    token_prop_offset: _token_proxy_property("OFFSET")
-    token_prop_trigger_frame: _token_proxy_property("TRIGGER_FRAME")
     token_prop_start_frame: _token_proxy_property("START_FRAME")
-    token_prop_end_frame: _token_proxy_property("END_FRAME")
     token_prop_period: _token_proxy_property("PERIOD")
     token_prop_duration: _token_proxy_property("DURATION")
     token_prop_ramp_frames: _token_proxy_property("RAMP_FRAMES")
-    token_prop_in_start: _token_proxy_property("IN_START")
-    token_prop_in_ramp: _token_proxy_property("IN_RAMP")
-    token_prop_out_start: _token_proxy_property("OUT_START")
-    token_prop_out_ramp: _token_proxy_property("OUT_RAMP")
-    token_prop_radius_x: _token_proxy_property("RADIUS_X")
-    token_prop_max_radius: _token_proxy_property("MAX_RADIUS")
-    token_prop_loops: _token_proxy_property("LOOPS")
-    token_prop_decay: _token_proxy_property("DECAY")
-    token_prop_freq: _token_proxy_property("FREQ")
-    token_prop_delay: _token_proxy_property("DELAY")
-    token_prop_target_value: _token_proxy_property("TARGET_VALUE")
-    token_prop_half_period: _token_proxy_property("HALF_PERIOD")
     token_prop_duty: _token_proxy_property("DUTY")
-    token_prop_flash_w: _token_proxy_property("FLASH_W")
-    token_prop_flash_gap: _token_proxy_property("FLASH_GAP")
-    token_prop_gap: _token_proxy_property("GAP")
-    token_prop_strobe_p: _token_proxy_property("STROBE_P")
-    token_prop_sharpness: _token_proxy_property("SHARPNESS")
-    token_prop_beat1: _token_proxy_property("BEAT1")
-    token_prop_beat2: _token_proxy_property("BEAT2")
-    token_prop_spread: _token_proxy_property("SPREAD")
-    token_prop_shape: _token_proxy_property("SHAPE")
-    token_prop_strike_f: _token_proxy_property("STRIKE_F")
-    token_prop_cycles: _token_proxy_property("CYCLES")
 
 
 def _assert_slots_cover_catalogue():
@@ -2942,16 +2247,15 @@ _assert_slots_cover_catalogue()
 CLASSES = (
     ESPRESSO_DriverTargetItem,
     ESPRESSO_DriverEditParamItem,
-    ESPRESSO_CameraTemplateTargetItem,
     ESPRESSO_Props,
 )
 
 
 def sync_driver_target_items(props, targets, effects=None, source=None):
-    """Repopulate props.driver_target_items from the given fcurves, but only
-    when the actual set of drivers has changed — rebuilding a collection of
-    hundreds of items on every single panel redraw (rigs with 700+ drivers
-    are real) would be needless per-frame overhead otherwise."""
+    """Repopulate props.driver_target_items from the given fcurves, but only when the
+    set of drivers has changed: rebuilding a collection of hundreds of items on every
+    panel redraw (rigs with 700+ drivers exist) would be needless overhead.
+    """
     from ...apply import driver_manager
     active_source = source or getattr(props, "driver_target_source", "ACTIVE")
     if getattr(props, "driver_target_items_source", "") == active_source:
@@ -2973,8 +2277,7 @@ def sync_driver_target_items(props, targets, effects=None, source=None):
             })
     group_state = read_driver_target_group_state(props, source=active_source)
     normalized = driver_manager.rows_for_targets(
-        normalized, group_state=group_state, effects=effects,
-        source=active_source,
+        normalized, group_state=group_state, source=active_source,
     )
     signature = "%s\x1f%s" % (active_source, driver_manager.rows_signature(normalized))
     if (
@@ -3014,16 +2317,10 @@ def sync_driver_target_items(props, targets, effects=None, source=None):
 
 
 def _prune_orphaned_template_ids(props):
-    """A removed/renamed template (e.g. an old id folded into heartbeat)
-    leaves its id sitting in saved favorites/recents/per-template-memory
-    forever otherwise — harmless dead bytes today, but worth cleaning up
-    before real user data accumulates around it."""
+    """A removed or renamed template (an old id folded into heartbeat, say) would
+    otherwise leave its id in saved recents and per-template memory indefinitely.
+    """
     known_ids = set(templates.TEMPLATE_BY_ID)
-
-    favorites = get_favorites(props)
-    pruned_favorites = [tid for tid in favorites if tid in known_ids]
-    if pruned_favorites != favorites:
-        props.favorites_mem = _write_id_list(pruned_favorites)
 
     recents = get_recents(props)
     pruned_recents = [tid for tid in recents if tid in known_ids]
@@ -3054,7 +2351,7 @@ def _refresh_all_previews_on_load(_dummy):
     the addon is updated (or, in dev, hot-reloaded) and the file is reopened,
     until the user happens to touch a parameter. Force every scene's cached
     preview to match whatever the currently-loaded addon code actually
-    produces, every time a file loads. Also prunes any saved favorite/recent/
+    produces, every time a file loads. Also prunes any saved recent/
     remembered-value reference to a template id that no longer exists."""
     context = bpy.context
     for scene in bpy.data.scenes:
@@ -3065,9 +2362,9 @@ def _refresh_all_previews_on_load(_dummy):
             _prune_orphaned_template_ids(props)
         except Exception:
             pass
-        # Empty last_template_id means a genuinely fresh scene — that case is
-        # handled by panels._ensure_template_initialized instead, which defers
-        # the write via a timer since draw() itself can't write props.
+        # Empty last_template_id means a fresh scene; that case is handled by
+        # panels._ensure_template_initialized, which defers the write through a timer
+        # because draw() cannot write props.
         if not props.last_template_id:
             continue
         try:
@@ -3103,14 +2400,11 @@ def _refresh_slot_tooltips_for_active_scene():
 
 def _refresh_slot_tooltips_deferred():
     _refresh_slot_tooltips_for_active_scene()
-    # Rebuild every cached preview too, not only the tooltips.
-    #
-    # load_post already covers OPENING a file. What it does not cover is the
-    # add-on being updated or reloaded while a file stays open - and that is
-    # the case that bites, because the cached string outlives the code that
-    # produced it. A template whose expression changed then applies with
-    # variables the binder no longer creates, and Blender reports it as
-    # "Unknown name(s)" naming variables that no longer exist anywhere.
+    # Rebuild every cached preview too, not only the tooltips. load_post covers opening
+    # a file, but not the add-on being updated or reloaded while a file stays open,
+    # where a cached string would outlive the code that produced it. A template whose
+    # expression changed would then apply with variables the binder no longer creates,
+    # and Blender would report "Unknown name(s)" naming variables that exist nowhere.
     try:
         _refresh_all_previews_on_load(None)
     except Exception:
@@ -3124,9 +2418,6 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.espresso_props = bpy.props.PointerProperty(type=ESPRESSO_Props)
-    bpy.types.Object.espresso_camera_template_targets = bpy.props.CollectionProperty(
-        type=ESPRESSO_CameraTemplateTargetItem,
-    )
     bpy.types.WindowManager.espresso_applied_dialog_parameters = bpy.props.CollectionProperty(
         type=ESPRESSO_DriverEditParamItem,
     )
@@ -3151,7 +2442,5 @@ def unregister():
         del bpy.types.WindowManager.espresso_applied_dialog_template_id
     if hasattr(bpy.types.Scene, "espresso_props"):
         del bpy.types.Scene.espresso_props
-    if hasattr(bpy.types.Object, "espresso_camera_template_targets"):
-        del bpy.types.Object.espresso_camera_template_targets
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

@@ -1,26 +1,17 @@
 # -*- coding: utf-8 -*-
 """What the right-click menu offers, as one table.
 
-One table decides whether an apply entry suits the loaded template and the
-clicked property, rather than each entry working it out from its own logic.
-They drifted apart, which is how a greyed "Apply Current Template" came to sit
-directly above an enabled "Apply to 17 Selected Objects" that routed through
-the same code and could only have failed.
+One table decides whether an apply entry suits the loaded template and the clicked
+property, rather than each entry working it out from its own logic. An entry declares
+the capability it needs from the template and carries the test for the property shape it
+needs. The menu draws the entries whose requirements the current pair satisfies and
+leaves out the rest.
 
-This is the single place that decides. An entry declares the CAPABILITY it
-needs from the template and carries the test for the property shape it needs.
-The menu draws the entries whose requirements the current pair satisfies and
-leaves out the rest: an operator that cannot help with the template on screen
-is not a choice, it is a thing to read past on the way to the one that works.
-
-Adding a TEMPLATE needs nothing here. Capabilities are derived from what a
-template already declares - whether it has a channel plan, a paired sibling, a
-spatial term - so a new recipe is classified the moment it exists rather than
-when someone remembers to register it. Every template in the catalogue must
-land on at least one capability, so a recipe whose shape no entry serves is
-caught here rather than becoming a menu that quietly offers nothing.
-
-Adding an OPERATOR is one MenuEntry in ENTRIES.
+Adding a template needs nothing here: capabilities are derived from what a template
+already declares (a channel plan, a paired sibling, a spatial term), so a new recipe is
+classified as soon as it exists. Every template in the catalogue must land on at least
+one capability, so a recipe whose shape no entry serves is caught here. Adding an
+operator is one MenuEntry in ENTRIES.
 """
 
 from __future__ import annotations
@@ -35,19 +26,13 @@ from ...catalogue import templates as template_catalogue
 # it is offered both the plain apply and the shared-material sweep.
 SINGLE = "SINGLE"        # one expression drives one value
 MOTION = "MOTION"        # a channel set, landing on an Object or on an array
-PAIRED = "PAIRED"        # has a sibling template for the other axis
-SPATIAL = "SPATIAL"      # carries a spatial term, so it can vary per object
-PALETTE = "PALETTE"      # drives a position along a ramp rather than a value
-
-ALL_CAPABILITIES = (SINGLE, MOTION, PAIRED, SPATIAL, PALETTE)
 
 
 def capabilities_for(template):
-    """Derive what this template can be driven as.
-
-    Read from the template's own declarations rather than a hand-kept list -
-    270 recipes is well past where a second list stays honest, and the failure
-    mode of a stale one is an operator that silently stops being offered.
+    """Derive what this template can be driven as. Read from the template's own
+    declarations rather than a hand-kept list, because with hundreds of recipes a
+    second list does not stay accurate, and a stale one means an operator silently
+    stops being offered.
     """
     if not template:
         return frozenset()
@@ -58,22 +43,6 @@ def capabilities_for(template):
         found.add(MOTION)
     else:
         found.add(SINGLE)
-
-    pair_id = template.get("pair_with")
-    if pair_id and pair_id in template_catalogue.TEMPLATE_BY_ID:
-        found.add(PAIRED)
-
-    # Imported lazily: shared_material_sweep reaches back into the catalogue,
-    # and this module is imported while the UI package is still assembling.
-    from ...apply import shared_material_sweep
-
-    if shared_material_sweep.kind_for(template) is not None:
-        found.add(SPATIAL)
-
-    from . import context_menu
-
-    if template.get("id") in context_menu.PALETTE_FACTOR_TEMPLATES:
-        found.add(PALETTE)
 
     return frozenset(found)
 
@@ -111,13 +80,6 @@ def drives_for(template):
             return TRANSFORM
         return VALUE
 
-    # A palette template drives a scalar, but that scalar is a position along a
-    # ramp built ON a colour socket - so a colour input is what it wants, even
-    # though its expression is one number.
-    from . import context_menu
-
-    if template.get("id") in context_menu.PALETTE_FACTOR_TEMPLATES:
-        return COLOUR
     return VALUE
 
 
@@ -141,12 +103,11 @@ ACCEPTS = {
 
 
 def shape_of(context):
-    """Classify the property under the cursor, or None when it cannot be read.
-
-    None means "do not gate on this" rather than "reject". A menu that hides
-    the right entry because it could not identify the property is worse than
-    one that shows a wrong entry - the artist can read the label, but cannot
-    click what is not drawn.
+    """Classify the property under the cursor, or None when it cannot be read. None
+    means "do not gate on this" rather than "reject": a menu that hides the right
+    entry because it could not identify the property is worse than one that shows a
+    wrong entry, since the artist can read the label but cannot click what is not
+    drawn.
     """
     prop = getattr(context, "button_prop", None)
     if prop is None:
@@ -194,17 +155,13 @@ BINDING = "BINDING"
 # instead - naming an input or a target is not applying anything, and burying
 # it under "Apply Template" would say it was.
 APPLY_GROUPS = (HERE, SELECTION)
-GROUP_ORDER = (HERE, SELECTION, BINDING)
 
 
 class MenuEntry:
-    """One row of the Driver Espresso block.
-
-    ``needs`` is satisfied when the template has ANY of the named capabilities,
-    not all of them - an entry that serves both a single expression and a
-    channel set names both. ``fits`` then answers the half that depends on what
-    was actually clicked, and is the existing predicate for that entry rather
-    than a reimplementation of it.
+    """One row of the Driver Espresso block. ``needs`` is satisfied when the template
+    has any of the named capabilities, not all of them: an entry that serves both a
+    single expression and a channel set names both. ``fits`` answers the half that
+    depends on what was clicked, and is the entry's existing predicate.
     """
 
     __slots__ = ("key", "idname", "icon", "needs", "fits", "label",
@@ -267,14 +224,10 @@ def build_entries():
         return bool(scene_props and source_binding.latest_source(scene_props))
 
     def fits_split(context, scene_props, template):
-        """Splitting only means something when the property lives on a
-        datablock objects SHARE.
-
-        A rotation belongs to one object and cannot be shared, so offering to
-        give each object its own copy of it is an operation with no subject -
-        it was appearing on transforms, where the answer is always "they are
-        already separate". material_slot_index is the same test execute uses
-        to decide whether it can actually split, asked before offering rather
+        """Splitting only means something when the property lives on a datablock that
+        objects share. A rotation belongs to one object, so offering each object its
+        own copy of it has no subject. ``material_slot_index`` is the same test
+        execute uses to decide whether it can split, asked before offering rather
         than after clicking.
         """
         if not fits_selection(context, scene_props, template):
@@ -288,12 +241,6 @@ def build_entries():
     def fits_multi(context, scene_props, template):
         return context_menu.ESPRESSO_OT_apply_multi_to_button.poll(context)
 
-    def fits_pair(context, scene_props, template):
-        return context_menu._pairable_vector_target(context) is not None
-
-    def fits_channels(context, scene_props, template):
-        return context_menu._channel_plan_on_clicked_array(context) is not None
-
     def channel_label(context, template):
         plan = context_menu._channel_plan_on_clicked_array(context)
         names = " / ".join(c.get("label", "") for c in plan[2]) if plan else ""
@@ -303,7 +250,7 @@ def build_entries():
         # --- acting on the property under the cursor ---------------------
         MenuEntry(
             "apply_current", "espresso.apply_to_button", "DRIVER",
-            (SINGLE, MOTION, PALETTE), fits_clicked,
+            (SINGLE, MOTION), fits_clicked,
             lambda context, template: "Apply Current Template",
             # Bake sits BESIDE plain apply on a split row: the driver action and
             # its freeze-this shortcut belong together, and the little REC dot
@@ -319,16 +266,11 @@ def build_entries():
             (SINGLE, MOTION), fits_multi,
             lambda context, template: "Apply Multi",
         ),
-        MenuEntry(
-            "apply_pair", "espresso.apply_pair_to_button", "ORIENTATION_GLOBAL",
-            (PAIRED,), fits_pair,
-            lambda context, template: "Apply Paired Templates (X/Y)",
-        ),
 
         # --- widening to the selection -----------------------------------
         MenuEntry(
             "apply_selected", "espresso.apply_to_selected_objects",
-            "OUTLINER_OB_GROUP_INSTANCE", (SINGLE, MOTION, PALETTE), fits_selection,
+            "OUTLINER_OB_GROUP_INSTANCE", (SINGLE, MOTION), fits_selection,
             lambda context, template: "Apply to %d Selected Objects" % _selected_count(context),
             group=SELECTION,
         ),
@@ -337,7 +279,7 @@ def build_entries():
             # material per object is a real change to the file, and which of the
             # two an artist wants is not something to guess at.
             "apply_selected_split", "espresso.apply_to_selected_objects", "MATERIAL",
-            (SINGLE, MOTION, PALETTE), fits_split,
+            (SINGLE, MOTION), fits_split,
             lambda context, template: "Apply to %d Selected (Split Shared Materials)" % _selected_count(context),
             properties={"split_shared_materials": True},
             group=SELECTION,
